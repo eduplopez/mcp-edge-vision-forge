@@ -24,6 +24,10 @@ class ModelLoadError(EdgeForgeError):
     """Raised when a PyTorch checkpoint cannot be loaded safely."""
 
 
+class PathAccessError(EdgeForgeError):
+    """Raised when a path escapes the roots permitted for agent driven access."""
+
+
 class ExportError(EdgeForgeError):
     """Raised when PyTorch to ONNX export fails."""
 

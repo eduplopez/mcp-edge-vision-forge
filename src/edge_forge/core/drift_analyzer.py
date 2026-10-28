@@ -24,7 +24,9 @@ from edge_forge.core.numerics import (
     signal_to_noise_db,
     top1_agreement,
 )
+from edge_forge.core.ort_utils import create_session
 from edge_forge.errors import DriftAnalysisError, ModelNotFoundError
+from edge_forge.limits import validate_input_shape, validate_num_samples
 from edge_forge.models.registry import extract_output_tensors
 from edge_forge.models.schemas import (
     DriftMetrics,
@@ -98,8 +100,10 @@ class DriftAnalyzer:
         reference_name: str | None = None,
     ) -> DriftReport:
         """Compare a PyTorch module with an ONNX artifact."""
-        if num_samples < 1:
-            raise DriftAnalysisError("num_samples must be at least 1")
+        try:
+            validate_num_samples(num_samples)
+        except ValueError as exc:
+            raise DriftAnalysisError(str(exc)) from exc
         candidate = Path(candidate_path).expanduser().resolve()
         if not candidate.exists():
             raise ModelNotFoundError(f"candidate ONNX artifact does not exist: {candidate}")
@@ -109,6 +113,10 @@ class DriftAnalyzer:
                 "drift analysis currently supports models with exactly one input"
             )
         shape = _resolve_shape(input_shape, info.input_specs, self._settings.default_input_shape)
+        try:
+            validate_input_shape(shape)
+        except ValueError as exc:
+            raise DriftAnalysisError(str(exc)) from exc
         session = self._create_session(candidate)
         input_name = session.get_inputs()[0].name
         rng = np.random.default_rng(self._settings.seed)
@@ -198,8 +206,10 @@ class DriftAnalyzer:
         thresholds: DriftThresholds | None = None,
     ) -> DriftReport:
         """Compare two ONNX artifacts, useful for auditing quantized variants."""
-        if num_samples < 1:
-            raise DriftAnalysisError("num_samples must be at least 1")
+        try:
+            validate_num_samples(num_samples)
+        except ValueError as exc:
+            raise DriftAnalysisError(str(exc)) from exc
         reference = Path(reference_path).expanduser().resolve()
         candidate = Path(candidate_path).expanduser().resolve()
         for path in (reference, candidate):
@@ -209,6 +219,10 @@ class DriftAnalyzer:
         shape = _resolve_shape(
             input_shape, reference_info.input_specs, self._settings.default_input_shape
         )
+        try:
+            validate_input_shape(shape)
+        except ValueError as exc:
+            raise DriftAnalysisError(str(exc)) from exc
         reference_session = self._create_session(reference)
         candidate_session = self._create_session(candidate)
         reference_input = reference_session.get_inputs()[0].name
@@ -273,6 +287,11 @@ class DriftAnalyzer:
 
     def _create_session(self, path: Path) -> ort.InferenceSession:
         try:
-            return ort.InferenceSession(str(path), providers=[self._provider])
+            return create_session(
+                str(path),
+                provider=self._provider,
+                intra_op_threads=self._settings.intra_op_threads,
+                inter_op_threads=self._settings.inter_op_threads,
+            )
         except Exception as exc:
             raise DriftAnalysisError(f"unable to load ONNX artifact {path}: {exc}") from exc

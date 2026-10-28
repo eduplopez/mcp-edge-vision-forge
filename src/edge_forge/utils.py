@@ -6,9 +6,12 @@ import hashlib
 import os
 import re
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
+
+from edge_forge.errors import ModelNotFoundError, PathAccessError
 
 _CHUNK_SIZE: Final[int] = 1024 * 1024
 _SLUG_PATTERN: Final[re.Pattern[str]] = re.compile(r"[^a-z0-9]+")
@@ -72,6 +75,45 @@ def resolve_path(value: str | os.PathLike[str], *, base: Path | None = None) -> 
     if not candidate.is_absolute() and base is not None:
         candidate = base / candidate
     return candidate.resolve()
+
+
+def resolve_within_roots(
+    value: str | os.PathLike[str],
+    roots: Sequence[Path],
+    *,
+    must_exist: bool = False,
+    label: str = "path",
+    enabled: bool = True,
+) -> Path:
+    """Resolve a path and confine it to a set of permitted roots.
+
+    Resolution happens before the containment check so that symbolic links and
+    ``..`` segments cannot escape the boundary. This is the guard used by the MCP
+    server for every path supplied by a client.
+
+    Args:
+        value: Path supplied by the caller.
+        roots: Directories that may contain the resolved path.
+        must_exist: Whether the resolved path has to exist on disk.
+        label: Parameter name reported in error messages.
+        enabled: When ``False`` the confinement check is skipped.
+
+    Returns:
+        The resolved absolute path.
+
+    Raises:
+        PathAccessError: If the path is outside every permitted root.
+        ModelNotFoundError: If ``must_exist`` is set and the path is missing.
+    """
+    resolved = Path(value).expanduser().resolve()
+    if enabled:
+        permitted = tuple(root.expanduser().resolve() for root in roots)
+        if not any(resolved.is_relative_to(root) for root in permitted):
+            allowed = ", ".join(str(root) for root in permitted) or "<none>"
+            raise PathAccessError(f"{label} '{resolved}' is outside the permitted roots: {allowed}")
+    if must_exist and not resolved.exists():
+        raise ModelNotFoundError(f"{label} does not exist: {resolved}")
+    return resolved
 
 
 def format_ms(value: float) -> str:

@@ -21,6 +21,7 @@ from edge_forge.core.exporter import OnnxExporter, inspect_onnx
 from edge_forge.core.profiler import ModelProfiler, available_providers, runtime_version
 from edge_forge.core.quantizer import QuantizationEngine
 from edge_forge.errors import EdgeForgeError
+from edge_forge.limits import validate_input_shape
 from edge_forge.models.registry import build_model, describe_models, inspect_torch_model, load_model
 from edge_forge.models.schemas import (
     CalibrationMethod,
@@ -66,9 +67,7 @@ def _parse_shape(value: str) -> tuple[int, ...]:
         shape = tuple(int(token) for token in tokens)
     except ValueError as exc:
         raise ValueError(f"invalid input shape '{value}'") from exc
-    if not shape or any(dimension <= 0 for dimension in shape):
-        raise ValueError("input shape dimensions must be strictly positive")
-    return shape
+    return validate_input_shape(shape)
 
 
 def _parse_precisions(value: str) -> list[Precision]:

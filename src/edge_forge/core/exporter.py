@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 import warnings
 from pathlib import Path
@@ -10,9 +11,8 @@ from typing import Any
 
 import numpy as np
 import onnx
-import onnxruntime as ort
 import torch
-from onnx import TensorProto, helper, numpy_helper
+from onnx import TensorProto, helper
 from torch import nn
 
 from edge_forge.config import MAX_OPSET, MIN_OPSET, ForgeSettings, get_settings
@@ -22,7 +22,9 @@ from edge_forge.core.numerics import (
     max_absolute_error,
     mean_squared_error,
 )
+from edge_forge.core.ort_utils import create_session
 from edge_forge.errors import ExportError, ModelNotFoundError, UnsupportedOpsetError
+from edge_forge.limits import validate_input_shape
 from edge_forge.models.registry import extract_output_tensors, make_dummy_input
 from edge_forge.models.schemas import (
     ExportOptions,
@@ -91,12 +93,14 @@ def inspect_onnx(path: str | Path, *, name: str | None = None) -> ModelInfo:
     if not resolved.exists():
         raise ModelNotFoundError(f"ONNX artifact does not exist: {resolved}")
     try:
-        model = onnx.load(str(resolved))
+        model = onnx.load(str(resolved), load_external_data=False)
     except Exception as exc:
         raise ExportError(f"unable to parse ONNX artifact {resolved}: {exc}") from exc
 
     metadata = {entry.key: entry.value for entry in model.metadata_props}
-    parameter_count = sum(int(numpy_helper.to_array(item).size) for item in model.graph.initializer)
+    parameter_count = sum(
+        math.prod(int(dimension) for dimension in item.dims) for item in model.graph.initializer
+    )
     data_types = {initializer.data_type for initializer in model.graph.initializer}
     declared_precision = metadata.get("precision")
     precision = Precision.FP32
@@ -233,8 +237,10 @@ class OnnxExporter:
         export_options = options or ExportOptions(opset=self._settings.default_opset)
         validate_opset(export_options.opset)
         shape = tuple(input_shape or self._settings.default_input_shape)
-        if not shape or any(dimension <= 0 for dimension in shape):
-            raise ExportError("input_shape must contain strictly positive dimensions")
+        try:
+            validate_input_shape(shape)
+        except ValueError as exc:
+            raise ExportError(str(exc)) from exc
         destination = Path(output_path).expanduser().resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -323,7 +329,12 @@ class OnnxExporter:
         resolved = Path(onnx_path).expanduser().resolve()
         dummy = make_dummy_input(tuple(input_shape), seed=self._settings.seed)
         try:
-            session = ort.InferenceSession(str(resolved), providers=[self._provider])
+            session = create_session(
+                str(resolved),
+                provider=self._provider,
+                intra_op_threads=self._settings.intra_op_threads,
+                inter_op_threads=self._settings.inter_op_threads,
+            )
             input_name = session.get_inputs()[0].name
             onnx_outputs = session.run(None, {input_name: dummy.numpy()})
         except Exception as exc:

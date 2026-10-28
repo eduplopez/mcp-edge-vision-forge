@@ -480,12 +480,11 @@ def load_model(
     seed: int = 0,
     allow_unsafe: bool = False,
 ) -> LoadedModel:
-    """Load a TorchScript module, a registered state dict or, opt-in, a pickle.
+    """Load a registered state dict or, opt-in, a TorchScript module or pickle.
 
-    State dictionaries and TorchScript archives are loaded with PyTorch's
-    restricted unpickler. Full ``nn.Module`` pickles can execute arbitrary code
-    during deserialization, so they are rejected unless ``allow_unsafe`` is set
-    explicitly by a trusted caller.
+    State dictionaries are loaded with PyTorch's restricted unpickler. TorchScript
+    archives and full ``nn.Module`` pickles can execute arbitrary code during
+    deserialization, so both require ``allow_unsafe=True`` from a trusted caller.
     """
     resolved = Path(path).expanduser().resolve()
     if not resolved.exists():
@@ -495,7 +494,7 @@ def load_model(
             "load_model handles PyTorch checkpoints only; use inspect_onnx for ONNX files"
         )
 
-    scripted = _load_torchscript(resolved)
+    scripted = _load_torchscript(resolved) if allow_unsafe else None
     if scripted is not None:
         scripted.eval()
         shape = input_shape or (1, 3, 32, 32)
@@ -513,8 +512,8 @@ def load_model(
     except Exception as safe_error:
         if not allow_unsafe:
             raise ModelLoadError(
-                "checkpoint is not a state dictionary or TorchScript archive; "
-                "loading a full module pickle requires allow_unsafe=True and a trusted file"
+                "checkpoint is not a state dictionary; loading a TorchScript archive or a "
+                "full module pickle requires allow_unsafe=True and a trusted file"
             ) from safe_error
         try:
             with warnings.catch_warnings():

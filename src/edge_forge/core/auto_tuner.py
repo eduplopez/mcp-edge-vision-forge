@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,8 @@ from edge_forge.models.schemas import (
 from edge_forge.utils import ensure_directory, iso_timestamp, short_id, slugify
 
 _LOGGER = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[int, int, str], None]
 
 
 class AutoTuner:
@@ -69,8 +72,21 @@ class AutoTuner:
         workdir: str | Path | None = None,
         run_id: str | None = None,
         drift_samples: int = 8,
+        progress: ProgressCallback | None = None,
     ) -> TuningResult:
-        """Search the configured space and return every evaluated candidate."""
+        """Search the configured space and return every evaluated candidate.
+
+        Args:
+            model: PyTorch module to optimize.
+            constraints: Deployment constraints and search space.
+            input_shape: Shape used for export, drift and benchmarking.
+            model_name: Human readable model name.
+            workdir: Directory that receives the generated artifacts.
+            run_id: Explicit run identifier.
+            drift_samples: Number of random samples used by drift analysis.
+            progress: Optional callback invoked as ``(completed, total, message)``
+                after every evaluated candidate so long searches can report status.
+        """
         started = time.perf_counter()
         active_constraints = constraints or TuningConstraints()
         shape = tuple(input_shape or self._settings.default_input_shape)
@@ -95,6 +111,16 @@ class AutoTuner:
         candidates: list[TuningCandidate] = []
         notes: list[str] = []
         counter = 0
+        extra_precisions = sum(
+            1
+            for precision in active_constraints.allowed_precisions
+            if precision is not Precision.FP32
+        )
+        planned = (
+            len(active_constraints.opset_candidates)
+            * len(active_constraints.simplify_candidates)
+            * (1 + extra_precisions)
+        )
 
         for opset in active_constraints.opset_candidates:
             for simplified in active_constraints.simplify_candidates:
@@ -135,6 +161,12 @@ class AutoTuner:
                     drift_samples=drift_samples,
                 )
                 candidates.append(fp32_candidate)
+                self._report(
+                    progress,
+                    counter,
+                    planned,
+                    f"evaluated fp32 candidate opset={opset} simplified={simplified}",
+                )
 
                 for precision in active_constraints.allowed_precisions:
                     if precision is Precision.FP32:
@@ -170,6 +202,12 @@ class AutoTuner:
                                 metadata={"export_path": str(onnx_path)},
                             )
                         )
+                        self._report(
+                            progress,
+                            counter,
+                            planned,
+                            f"{candidate_id} {precision.value} failed during quantization",
+                        )
                         continue
                     candidate = self._evaluate_candidate(
                         candidate_id=candidate_id,
@@ -188,6 +226,12 @@ class AutoTuner:
                     candidate.metadata["compression_ratio"] = quantization.compression_ratio
                     candidate.metadata["calibration_samples"] = quantization.calibration_samples
                     candidates.append(candidate)
+                    self._report(
+                        progress,
+                        counter,
+                        planned,
+                        f"evaluated {precision.value} candidate {candidate_id}",
+                    )
 
         if not candidates:
             raise TuningError(
@@ -203,7 +247,7 @@ class AutoTuner:
             None,
         )
         for candidate in candidates:
-            candidate.score = self._score(candidate, baseline)
+            candidate.score = self._score(candidate, baseline, active_constraints)
         candidates.sort(key=self._sort_key)
         feasible = [candidate for candidate in candidates if candidate.feasible]
         best = max(feasible, key=lambda candidate: candidate.score) if feasible else None
@@ -314,7 +358,11 @@ class AutoTuner:
         )
 
     @staticmethod
-    def _score(candidate: TuningCandidate, baseline: TuningCandidate | None) -> float:
+    def _score(
+        candidate: TuningCandidate,
+        baseline: TuningCandidate | None,
+        constraints: TuningConstraints,
+    ) -> float:
         if candidate.benchmark is None or candidate.drift is None:
             return 0.0
         latency = candidate.benchmark.latency.p50_ms
@@ -328,7 +376,27 @@ class AutoTuner:
         latency_gain = baseline_latency / max(latency, 1e-6)
         size_gain = baseline_size / max(size, 1e-6)
         fidelity = max(0.0, min(1.0, candidate.drift.metrics.cosine_similarity))
-        return round(0.5 * latency_gain + 0.3 * size_gain + 0.2 * fidelity, 6)
+        return round(
+            constraints.score_weight_latency * latency_gain
+            + constraints.score_weight_size * size_gain
+            + constraints.score_weight_drift * fidelity,
+            6,
+        )
+
+    @staticmethod
+    def _report(
+        progress: ProgressCallback | None,
+        completed: int,
+        total: int,
+        message: str,
+    ) -> None:
+        """Invoke the optional progress callback without breaking the search."""
+        if progress is None:
+            return
+        try:
+            progress(completed, total, message)
+        except Exception:
+            _LOGGER.debug("progress callback raised", exc_info=True)
 
     @staticmethod
     def _sort_key(candidate: TuningCandidate) -> tuple[int, float, int]:

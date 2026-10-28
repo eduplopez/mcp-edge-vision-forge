@@ -7,6 +7,7 @@ be supplied through constructor arguments, environment variables prefixed with
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -15,6 +16,7 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from edge_forge.errors import ConfigurationError
+from edge_forge.limits import MAX_CALIBRATION_SAMPLES
 from edge_forge.utils import ensure_directory
 
 SUPPORTED_OPSETS: tuple[int, ...] = tuple(range(11, 24))
@@ -58,8 +60,22 @@ class ForgeSettings(BaseSettings):
     seed: int = Field(default=42, ge=0)
     intra_op_threads: int = Field(default=0, ge=0, le=256)
     inter_op_threads: int = Field(default=1, ge=1, le=64)
-    calibration_samples: int = Field(default=16, ge=1, le=4096)
+    calibration_samples: int = Field(default=16, ge=1, le=MAX_CALIBRATION_SAMPLES)
     max_workers: int = Field(default=1, ge=1, le=64)
+    restrict_paths: bool = Field(
+        default=True,
+        description=(
+            "Confine MCP tool paths to the permitted roots. Disable only for trusted "
+            "single-user deployments that must reach arbitrary files."
+        ),
+    )
+    extra_allowed_roots: str = Field(
+        default="",
+        description=(
+            "Additional directories the MCP server may read and write, separated by "
+            "os.pathsep. The workspace, reports and cache directories are always allowed."
+        ),
+    )
     server_host: str = Field(default="127.0.0.1", min_length=1)
     server_port: int = Field(default=8000, ge=1, le=65535)
     server_transport: TransportName = "stdio"
@@ -110,6 +126,27 @@ class ForgeSettings(BaseSettings):
     def quantized_dir(self) -> Path:
         """Directory holding quantized ONNX artifacts."""
         return self.workspace / "quantized"
+
+    @property
+    def permitted_roots(self) -> tuple[Path, ...]:
+        """Directories the MCP server may touch when path confinement is enabled.
+
+        The workspace, reports and cache directories are always included, together
+        with the current working directory and any extra roots supplied through
+        ``EDGE_FORGE_EXTRA_ALLOWED_ROOTS``.
+        """
+        candidates = [self.workspace, self.reports_dir, self.cache_dir, Path.cwd()]
+        candidates.extend(
+            Path(item.strip()).expanduser()
+            for item in self.extra_allowed_roots.split(os.pathsep)
+            if item.strip()
+        )
+        unique: list[Path] = []
+        for candidate in candidates:
+            resolved = candidate.expanduser().resolve()
+            if resolved not in unique:
+                unique.append(resolved)
+        return tuple(unique)
 
 
 @lru_cache(maxsize=1)

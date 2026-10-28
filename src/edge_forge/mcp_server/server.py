@@ -4,16 +4,27 @@ The module targets the modern ``mcp`` Python SDK (``MCPServer``, formerly
 ``FastMCP``) and keeps a compatibility shim for SDK 1.x deployments where the
 class is still exported as ``FastMCP``. Every tool returns JSON encoded text so
 that any MCP client can consume the result without custom decoders.
+
+Three safety layers apply to every client call:
+
+* heavy work runs in a worker thread through ``asyncio.to_thread`` so the event
+  loop keeps serving requests and progress notifications;
+* every path supplied by a client is resolved and confined to the permitted
+  roots unless ``EDGE_FORGE_RESTRICT_PATHS=false`` disables the guard;
+* anticipated failures are reported as ``ToolError`` with a structured JSON
+  payload instead of an opaque protocol error.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 
 from edge_forge import __version__
 from edge_forge.config import ForgeSettings, get_settings
@@ -23,6 +34,7 @@ from edge_forge.core.exporter import OnnxExporter, inspect_onnx
 from edge_forge.core.profiler import ModelProfiler, available_providers, runtime_version
 from edge_forge.core.quantizer import QuantizationEngine
 from edge_forge.errors import EdgeForgeError
+from edge_forge.limits import validate_input_shape, validate_model_parameters
 from edge_forge.models.registry import (
     build_model,
     describe_models,
@@ -44,16 +56,21 @@ from edge_forge.reporting.report_gen import (
     build_forge_report,
     render_markdown,
 )
-from edge_forge.utils import iso_timestamp, short_id
+from edge_forge.utils import iso_timestamp, resolve_within_roots, short_id
 
 _LOGGER = logging.getLogger(__name__)
+_ResultT = TypeVar("_ResultT")
 
 try:
+    from mcp.server.mcpserver import Context
     from mcp.server.mcpserver import MCPServer as _ServerBackend
+    from mcp.server.mcpserver.exceptions import ToolError
 
     _SDK_FLAVOR = "mcp.server.mcpserver.MCPServer"
-except ImportError:
+except ImportError:  # pragma: no cover - exercised only with SDK 1.x
+    from mcp.server.fastmcp import Context  # type: ignore[attr-defined,no-redef]
     from mcp.server.fastmcp import FastMCP as _ServerBackend  # type: ignore[attr-defined,no-redef]
+    from mcp.server.fastmcp.exceptions import ToolError  # type: ignore[import-not-found,no-redef]
 
     _SDK_FLAVOR = "mcp.server.fastmcp.FastMCP"
 
@@ -63,8 +80,11 @@ INSTRUCTIONS = (
     "ONNX, quantize_model for FP16 or INT8, analyze_drift to verify numerical fidelity, "
     "benchmark_model for latency and memory, and auto_tune to search the configuration space "
     "under deployment constraints. Tuning runs are persisted and can be rendered with "
-    "generate_report."
+    "generate_report. Paths are confined to the workspace, reports and cache directories by "
+    "default; see EDGE_FORGE_RESTRICT_PATHS and EDGE_FORGE_EXTRA_ALLOWED_ROOTS."
 )
+
+_HANDLED_ERRORS: tuple[type[Exception], ...] = (EdgeForgeError, ValueError, OSError)
 
 
 def _json(payload: Any) -> str:
@@ -90,9 +110,50 @@ def _precision(value: str | Precision | None, default: Precision) -> Precision:
 def _parse_shape(value: list[int] | None, fallback: tuple[int, ...]) -> tuple[int, ...]:
     if value is None:
         return fallback
-    if not value or any(int(dimension) <= 0 for dimension in value):
-        raise ValueError("input_shape must contain strictly positive dimensions")
-    return tuple(int(dimension) for dimension in value)
+    return validate_input_shape(tuple(int(dimension) for dimension in value))
+
+
+def _tool_failure(error: Exception) -> Exception:
+    """Build the structured payload surfaced to the MCP client."""
+    return ToolError(
+        json.dumps(
+            {
+                "error": type(error).__name__,
+                "message": str(error),
+                "retryable": False,
+            },
+            ensure_ascii=True,
+        )
+    )
+
+
+async def _run_blocking(operation: Callable[[], _ResultT]) -> _ResultT:
+    """Run blocking work off the event loop and translate expected failures."""
+    try:
+        return await asyncio.to_thread(operation)
+    except _HANDLED_ERRORS as exc:
+        raise _tool_failure(exc) from exc
+
+
+def _progress_reporter(context: Context) -> Callable[[int, int, str], None]:
+    """Bridge a synchronous progress callback to the async MCP context."""
+    loop = asyncio.get_running_loop()
+
+    def report(completed: int, total: int, message: str) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            context.report_progress(completed, total, message), loop
+        )
+
+        def _log_failure(done: Any) -> None:
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                _LOGGER.debug("progress notification failed: %s", error)
+
+        future.add_done_callback(_log_failure)
+
+    return report
 
 
 def create_server(settings: ForgeSettings | None = None) -> Any:
@@ -126,6 +187,26 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
     reports = ReportGenerator(active)
     store = RunStore(active)
 
+    def read_path(value: str, label: str = "model_path") -> Path:
+        """Resolve a client supplied input path and confine it to the roots."""
+        return resolve_within_roots(
+            value,
+            active.permitted_roots,
+            must_exist=True,
+            label=label,
+            enabled=active.restrict_paths,
+        )
+
+    def write_path(value: str, label: str = "output_path") -> Path:
+        """Resolve a client supplied output path and confine it to the roots."""
+        return resolve_within_roots(
+            value,
+            active.permitted_roots,
+            must_exist=False,
+            label=label,
+            enabled=active.restrict_paths,
+        )
+
     @server.tool(
         name="list_models",
         description="List the reproducible reference architectures available for benchmarking.",
@@ -142,7 +223,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
 
     @server.tool(
         name="system_info",
-        description="Report package, ONNX Runtime and execution provider information.",
+        description="Report package, ONNX Runtime, execution provider and path policy information.",
     )
     def system_info_tool() -> str:
         return _json(
@@ -153,6 +234,8 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
                 "providers": available_providers(),
                 "workspace": str(active.workspace),
                 "reports_dir": str(active.reports_dir),
+                "restrict_paths": active.restrict_paths,
+                "permitted_roots": [str(root) for root in active.permitted_roots],
                 "timestamp": iso_timestamp(),
             }
         )
@@ -161,19 +244,22 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
         name="inspect_model",
         description="Inspect an ONNX or PyTorch artifact and return its tensor metadata.",
     )
-    def inspect_model_tool(model_path: str) -> str:
-        path = Path(model_path).expanduser().resolve()
-        if path.suffix.lower() == ".onnx":
-            return _json(_dump(inspect_onnx(path)))
-        loaded = load_model(path)
-        info = inspect_torch_model(
-            loaded.model,
-            loaded.input_shape,
-            name=path.stem,
-            architecture=loaded.architecture,
-            seed=active.seed,
-        )
-        return _json(_dump(info))
+    async def inspect_model_tool(model_path: str) -> str:
+        def work() -> str:
+            path = read_path(model_path)
+            if path.suffix.lower() == ".onnx":
+                return _json(_dump(inspect_onnx(path)))
+            loaded = load_model(path)
+            info = inspect_torch_model(
+                loaded.model,
+                loaded.input_shape,
+                name=path.stem,
+                architecture=loaded.architecture,
+                seed=active.seed,
+            )
+            return _json(_dump(info))
+
+        return await _run_blocking(work)
 
     @server.tool(
         name="export_model",
@@ -182,7 +268,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             "graph simplification and numerical validation."
         ),
     )
-    def export_model_tool(
+    async def export_model_tool(
         model_name: str = "edge_cnn",
         output_path: str | None = None,
         opset: int = 17,
@@ -194,34 +280,38 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
         depth: int = 3,
         num_classes: int = 10,
     ) -> str:
-        shape = _parse_shape(input_shape, (1, 3, 32, 32))
-        model = build_model(
-            model_name,
-            width=width,
-            depth=depth,
-            num_classes=num_classes,
-        )
-        destination = (
-            Path(output_path).expanduser().resolve()
-            if output_path
-            else _default_output(
-                active.exports_dir,
-                f"{model_name}-opset{opset}-{short_id()}",
+        def work() -> str:
+            shape = _parse_shape(input_shape, (1, 3, 32, 32))
+            validate_model_parameters(width=width, depth=depth, num_classes=num_classes)
+            model = build_model(
+                model_name,
+                width=width,
+                depth=depth,
+                num_classes=num_classes,
             )
-        )
-        result = exporter.export(
-            model,
-            destination,
-            input_shape=shape,
-            options=ExportOptions(
-                opset=opset,
-                dynamic_batch=dynamic_batch,
-                dynamic_spatial=dynamic_spatial,
-                simplify=simplify,
-            ),
-            name=model_name,
-        )
-        return _json(_dump(result))
+            destination = (
+                write_path(output_path)
+                if output_path
+                else _default_output(
+                    active.exports_dir,
+                    f"{model_name}-opset{opset}-{short_id()}",
+                )
+            )
+            result = exporter.export(
+                model,
+                destination,
+                input_shape=shape,
+                options=ExportOptions(
+                    opset=opset,
+                    dynamic_batch=dynamic_batch,
+                    dynamic_spatial=dynamic_spatial,
+                    simplify=simplify,
+                ),
+                name=model_name,
+            )
+            return _json(_dump(result))
+
+        return await _run_blocking(work)
 
     @server.tool(
         name="quantize_model",
@@ -230,7 +320,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             "real calibration data."
         ),
     )
-    def quantize_model_tool(
+    async def quantize_model_tool(
         model_path: str,
         precision: str = "int8_dynamic",
         output_path: str | None = None,
@@ -240,30 +330,41 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
         per_channel: bool = True,
         reduce_range: bool = False,
         quant_format: str = "qdq",
+        nodes_to_exclude: list[str] | None = None,
     ) -> str:
-        selected = _precision(precision, Precision.INT8_DYNAMIC)
-        destination = (
-            Path(output_path).expanduser().resolve()
-            if output_path
-            else _default_output(
-                active.quantized_dir,
-                f"{Path(model_path).stem}.{selected.value}",
+        def work() -> str:
+            source = read_path(model_path)
+            selected = _precision(precision, Precision.INT8_DYNAMIC)
+            destination = (
+                write_path(output_path)
+                if output_path
+                else _default_output(
+                    active.quantized_dir,
+                    f"{source.stem}.{selected.value}",
+                )
             )
-        )
-        result = quantizer.quantize(
-            model_path,
-            destination,
-            options=QuantizationOptions(
-                precision=selected,
-                calibration_samples=calibration_samples,
-                calibration_method=CalibrationMethod(calibration_method),
-                calibration_data_path=calibration_data_path,
-                per_channel=per_channel,
-                reduce_range=reduce_range,
-                quant_format=cast(Literal["qdq", "qoperator"], quant_format),
-            ),
-        )
-        return _json(_dump(result))
+            calibration_path = (
+                read_path(calibration_data_path, "calibration_data_path")
+                if calibration_data_path
+                else None
+            )
+            result = quantizer.quantize(
+                source,
+                destination,
+                options=QuantizationOptions(
+                    precision=selected,
+                    calibration_samples=calibration_samples,
+                    calibration_method=CalibrationMethod(calibration_method),
+                    calibration_data_path=str(calibration_path) if calibration_path else None,
+                    per_channel=per_channel,
+                    reduce_range=reduce_range,
+                    quant_format=cast(Literal["qdq", "qoperator"], quant_format),
+                    nodes_to_exclude=list(nodes_to_exclude or []),
+                ),
+            )
+            return _json(_dump(result))
+
+        return await _run_blocking(work)
 
     @server.tool(
         name="analyze_drift",
@@ -272,7 +373,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             "return cosine similarity, MSE, MAE, max error and KL divergence."
         ),
     )
-    def analyze_drift_tool(
+    async def analyze_drift_tool(
         candidate_path: str,
         reference_model: str = "edge_cnn",
         reference_onnx_path: str | None = None,
@@ -283,32 +384,37 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
         depth: int = 3,
         num_classes: int = 10,
     ) -> str:
-        shape = _parse_shape(input_shape, (1, 3, 32, 32))
-        thresholds = DriftThresholds(min_cosine_similarity=min_cosine_similarity)
-        if reference_onnx_path:
-            report = analyzer.compare_onnx(
-                reference_onnx_path,
-                candidate_path,
-                input_shape=shape,
-                num_samples=num_samples,
-                thresholds=thresholds,
-            )
-        else:
-            model = build_model(
-                reference_model,
-                width=width,
-                depth=depth,
-                num_classes=num_classes,
-            )
-            report = analyzer.compare(
-                model,
-                candidate_path,
-                input_shape=shape,
-                num_samples=num_samples,
-                thresholds=thresholds,
-                reference_name=reference_model,
-            )
-        return _json(_dump(report))
+        def work() -> str:
+            shape = _parse_shape(input_shape, (1, 3, 32, 32))
+            validate_model_parameters(width=width, depth=depth, num_classes=num_classes)
+            candidate = read_path(candidate_path, "candidate_path")
+            thresholds = DriftThresholds(min_cosine_similarity=min_cosine_similarity)
+            if reference_onnx_path:
+                report = analyzer.compare_onnx(
+                    read_path(reference_onnx_path, "reference_onnx_path"),
+                    candidate,
+                    input_shape=shape,
+                    num_samples=num_samples,
+                    thresholds=thresholds,
+                )
+            else:
+                model = build_model(
+                    reference_model,
+                    width=width,
+                    depth=depth,
+                    num_classes=num_classes,
+                )
+                report = analyzer.compare(
+                    model,
+                    candidate,
+                    input_shape=shape,
+                    num_samples=num_samples,
+                    thresholds=thresholds,
+                    reference_name=reference_model,
+                )
+            return _json(_dump(report))
+
+        return await _run_blocking(work)
 
     @server.tool(
         name="benchmark_model",
@@ -316,7 +422,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             "Benchmark an ONNX model with warmup, p50/p90/p99 latency, FPS, RAM and CPU usage."
         ),
     )
-    def benchmark_model_tool(
+    async def benchmark_model_tool(
         model_path: str,
         input_shape: list[int] | None = None,
         warmup_runs: int = 5,
@@ -324,16 +430,19 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
         hardware_profile: str = "generic-x86",
         precision: str | None = None,
     ) -> str:
-        shape = _parse_shape(input_shape, (1, 3, 32, 32))
-        report = profiler.benchmark(
-            model_path,
-            input_shape=shape,
-            warmup_runs=warmup_runs,
-            iterations=iterations,
-            hardware_profile=hardware_profile,
-            precision=_precision(precision, Precision.FP32) if precision else None,
-        )
-        return _json(_dump(report))
+        def work() -> str:
+            shape = _parse_shape(input_shape, (1, 3, 32, 32))
+            report = profiler.benchmark(
+                read_path(model_path),
+                input_shape=shape,
+                warmup_runs=warmup_runs,
+                iterations=iterations,
+                hardware_profile=hardware_profile,
+                precision=_precision(precision, Precision.FP32) if precision else None,
+            )
+            return _json(_dump(report))
+
+        return await _run_blocking(work)
 
     @server.tool(
         name="auto_tune",
@@ -342,7 +451,8 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             "fidelity constraints; persist the run and return the ranked candidates."
         ),
     )
-    def auto_tune_tool(
+    async def auto_tune_tool(
+        context: Context,
         model_name: str = "edge_cnn",
         input_shape: list[int] | None = None,
         max_latency_ms: float | None = None,
@@ -360,6 +470,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
         persist: bool = True,
     ) -> str:
         shape = _parse_shape(input_shape, (1, 3, 32, 32))
+        validate_model_parameters(width=width, depth=depth, num_classes=num_classes)
         constraints = TuningConstraints(
             max_latency_ms=max_latency_ms,
             min_cosine_similarity=min_cosine_similarity,
@@ -386,39 +497,47 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             depth=depth,
             num_classes=num_classes,
         )
-        result = tuner.tune(
-            model,
-            constraints=constraints,
-            input_shape=shape,
-            model_name=model_name,
-        )
-        if persist:
-            store.save(result)
-        payload = summarize_tuning(result)
-        payload["constraints"] = _dump(result.constraints)
-        payload["hardware_profile"] = _dump(result.hardware_profile)
-        payload["candidates"] = [
-            {
-                "candidate_id": candidate.candidate_id,
-                "precision": candidate.precision.value,
-                "opset": candidate.opset,
-                "simplified": candidate.simplified,
-                "size_mb": candidate.size_mb,
-                "feasible": candidate.feasible,
-                "score": candidate.score,
-                "p99_ms": (
-                    candidate.benchmark.latency.p99_ms if candidate.benchmark is not None else None
-                ),
-                "cosine_similarity": (
-                    candidate.drift.metrics.cosine_similarity
-                    if candidate.drift is not None
-                    else None
-                ),
-                "rejection_reasons": candidate.rejection_reasons,
-            }
-            for candidate in result.candidates
-        ]
-        return _json(payload)
+        report_progress = _progress_reporter(context)
+
+        def work() -> str:
+            result = tuner.tune(
+                model,
+                constraints=constraints,
+                input_shape=shape,
+                model_name=model_name,
+                progress=report_progress,
+            )
+            if persist:
+                store.save(result)
+            payload = summarize_tuning(result)
+            payload["constraints"] = _dump(result.constraints)
+            payload["hardware_profile"] = _dump(result.hardware_profile)
+            payload["candidates"] = [
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "precision": candidate.precision.value,
+                    "opset": candidate.opset,
+                    "simplified": candidate.simplified,
+                    "size_mb": candidate.size_mb,
+                    "feasible": candidate.feasible,
+                    "score": candidate.score,
+                    "p99_ms": (
+                        candidate.benchmark.latency.p99_ms
+                        if candidate.benchmark is not None
+                        else None
+                    ),
+                    "cosine_similarity": (
+                        candidate.drift.metrics.cosine_similarity
+                        if candidate.drift is not None
+                        else None
+                    ),
+                    "rejection_reasons": candidate.rejection_reasons,
+                }
+                for candidate in result.candidates
+            ]
+            return _json(payload)
+
+        return await _run_blocking(work)
 
     @server.tool(
         name="list_reports",
@@ -431,28 +550,34 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
         name="generate_report",
         description="Render a persisted tuning run as JSON, Markdown and self-contained HTML.",
     )
-    def generate_report_tool(
+    async def generate_report_tool(
         run_id: str,
         formats: list[str] | None = None,
     ) -> str:
-        artifacts = reports.generate_from_run(
-            run_id, formats=formats or ["json", "markdown", "html"]
-        )
-        return _json(_dump(artifacts))
+        def work() -> str:
+            artifacts = reports.generate_from_run(
+                run_id, formats=formats or ["json", "markdown", "html"]
+            )
+            return _json(_dump(artifacts))
+
+        return await _run_blocking(work)
 
     @server.tool(
         name="read_report",
         description="Return the Markdown or JSON report for a persisted tuning run.",
     )
-    def read_report_tool(run_id: str, report_format: str = "markdown") -> str:
-        result = store.load(run_id)
-        report = build_forge_report(result)
-        if report_format == "json":
-            return report.model_dump_json(indent=2)
-        if report_format == "html":
-            artifacts = reports.generate(result, formats=["html"])
-            return Path(artifacts.files["html"]).read_text(encoding="utf-8")
-        return render_markdown(report)
+    async def read_report_tool(run_id: str, report_format: str = "markdown") -> str:
+        def work() -> str:
+            result = store.load(run_id)
+            report = build_forge_report(result)
+            if report_format == "json":
+                return report.model_dump_json(indent=2)
+            if report_format == "html":
+                artifacts = reports.generate(result, formats=["html"])
+                return Path(artifacts.files["html"]).read_text(encoding="utf-8")
+            return render_markdown(report)
+
+        return await _run_blocking(work)
 
     @server.resource(
         "edge-forge://catalog/models",
@@ -485,6 +610,8 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
                 "sdk": _SDK_FLAVOR,
                 "onnxruntime": runtime_version(),
                 "providers": available_providers(),
+                "restrict_paths": active.restrict_paths,
+                "permitted_roots": [str(root) for root in active.permitted_roots],
                 "timestamp": iso_timestamp(),
             }
         )
@@ -527,6 +654,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--workspace", default=None, help="Workspace directory for artifacts.")
     parser.add_argument("--reports-dir", default=None, help="Directory for reports and run state.")
     parser.add_argument(
+        "--allow-unconfined-paths",
+        action="store_true",
+        help="Disable path confinement for this process (trusted single-user deployments).",
+    )
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
         default=None,
@@ -539,6 +671,8 @@ def main(argv: list[str] | None = None) -> None:
         overrides["reports_dir"] = Path(arguments.reports_dir)
     if arguments.log_level:
         overrides["log_level"] = arguments.log_level
+    if arguments.allow_unconfined_paths:
+        overrides["restrict_paths"] = False
     settings = ForgeSettings(**overrides) if overrides else get_settings()
     logging.basicConfig(
         level=getattr(logging, settings.log_level),

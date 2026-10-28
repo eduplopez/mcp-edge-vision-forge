@@ -10,7 +10,6 @@ from typing import Any
 
 import numpy as np
 import onnx
-import onnxruntime as ort
 from onnx import helper
 from onnxconverter_common import float16
 from onnxruntime.quantization import (
@@ -27,6 +26,7 @@ from onnxruntime.quantization.shape_inference import quant_pre_process
 
 from edge_forge.config import ForgeSettings, get_settings
 from edge_forge.core.exporter import inspect_onnx
+from edge_forge.core.ort_utils import create_session
 from edge_forge.errors import CalibrationError, ModelNotFoundError, QuantizationError
 from edge_forge.models.schemas import (
     CalibrationMethod,
@@ -308,6 +308,8 @@ class QuantizationEngine:
         }
         if quant_options.precision is Precision.INT8_STATIC:
             metadata["calibration_method"] = quant_options.calibration_method.value
+        if quant_options.nodes_to_exclude:
+            metadata["nodes_to_exclude"] = ",".join(quant_options.nodes_to_exclude)
         self._logger.info(
             "quantized %s to %s (%.4f MiB -> %.4f MiB)",
             source_path.name,
@@ -354,6 +356,7 @@ class QuantizationEngine:
             reduce_range=options.reduce_range,
             weight_type=_WEIGHT_TYPES[options.weight_type],
             op_types_to_quantize=options.op_types_to_quantize,
+            nodes_to_exclude=options.nodes_to_exclude or None,
             extra_options=extra_options,
         )
 
@@ -391,6 +394,7 @@ class QuantizationEngine:
                 weight_type=_WEIGHT_TYPES[options.weight_type],
                 op_types_to_quantize=options.op_types_to_quantize,
                 calibrate_method=OrtCalibrationMethod.MinMax,
+                nodes_to_exclude=options.nodes_to_exclude or None,
                 extra_options=options.extra_options,
             )
         finally:
@@ -398,7 +402,12 @@ class QuantizationEngine:
 
     def _validate_artifact(self, path: Path) -> None:
         try:
-            session = ort.InferenceSession(str(path), providers=[self._provider])
+            session = create_session(
+                str(path),
+                provider=self._provider,
+                intra_op_threads=self._settings.intra_op_threads,
+                inter_op_threads=self._settings.inter_op_threads,
+            )
         except Exception as exc:
             raise QuantizationError(f"quantized artifact is not loadable: {exc}") from exc
         if not session.get_inputs():

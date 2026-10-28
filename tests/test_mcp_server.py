@@ -8,6 +8,9 @@ from collections.abc import Coroutine
 from pathlib import Path
 from typing import Any
 
+import pytest
+from mcp.server.mcpserver.exceptions import ToolError
+
 from edge_forge.mcp_server.server import create_server, main
 
 
@@ -197,6 +200,58 @@ def test_unknown_tool_returns_error(settings) -> None:
         assert "does_not_exist" in str(error) or "not found" in str(error).lower()
         return
     assert result.is_error is True
+
+
+def test_path_confinement_rejects_artifacts_outside_roots(settings, fp32_onnx: Path) -> None:
+    server = create_server(settings)
+    outside = fp32_onnx.parent.parent.parent / "external" / "model.onnx"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_bytes(fp32_onnx.read_bytes())
+
+    with pytest.raises(ToolError) as blocked:
+        _run(server.call_tool("inspect_model", {"model_path": str(outside)}))
+    text = str(blocked.value)
+    assert "PathAccessError" in text
+    assert "outside the permitted roots" in text
+
+    unconfined = settings.model_copy(update={"restrict_paths": False})
+    allowed = _payload(
+        _run(create_server(unconfined).call_tool("inspect_model", {"model_path": str(outside)}))
+    )
+    assert allowed["opset"] == 17
+
+
+def test_invalid_arguments_return_structured_errors(settings) -> None:
+    server = create_server(settings)
+    with pytest.raises(ToolError) as failure:
+        _run(
+            server.call_tool(
+                "export_model",
+                {"model_name": "edge_cnn", "input_shape": [1, 3, 0, 0]},
+            )
+        )
+    text = str(failure.value)
+    assert "ValueError" in text
+    assert "strictly positive" in text
+
+
+def test_oversized_model_request_is_rejected(settings) -> None:
+    server = create_server(settings)
+    with pytest.raises(ToolError) as failure:
+        _run(
+            server.call_tool(
+                "export_model",
+                {"model_name": "edge_cnn", "width": 100000, "depth": 1},
+            )
+        )
+    assert "width must be between" in str(failure.value)
+
+
+def test_system_info_reports_path_policy(settings) -> None:
+    server = create_server(settings)
+    info = _payload(_run(server.call_tool("system_info", {})))
+    assert info["restrict_paths"] is True
+    assert str(settings.workspace.resolve()) in info["permitted_roots"]
 
 
 def test_main_dispatches_transport(monkeypatch, tmp_path: Path) -> None:

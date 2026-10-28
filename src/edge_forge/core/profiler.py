@@ -14,7 +14,9 @@ import psutil
 
 from edge_forge.config import ForgeSettings, get_settings
 from edge_forge.core.exporter import inspect_onnx
+from edge_forge.core.ort_utils import create_session
 from edge_forge.errors import BenchmarkError, ModelNotFoundError
+from edge_forge.limits import validate_input_shape, validate_iterations, validate_warmup_runs
 from edge_forge.models.schemas import (
     BenchmarkReport,
     HardwareProfile,
@@ -106,6 +108,10 @@ def _input_arrays(
                 dimension if isinstance(dimension, int) and dimension > 0 else 1
                 for dimension in model_input.shape
             )
+        try:
+            validate_input_shape(shape, label=f"input '{model_input.name}' shape")
+        except ValueError as exc:
+            raise BenchmarkError(str(exc)) from exc
         if "float16" in model_input.type:
             dtype: Any = np.float16
         elif "float64" in model_input.type:
@@ -172,10 +178,11 @@ class ModelProfiler:
         metadata: dict[str, Any] | None = None,
     ) -> BenchmarkReport:
         """Run a benchmark and return latency and resource statistics."""
-        if iterations < 1:
-            raise BenchmarkError("iterations must be at least 1")
-        if warmup_runs < 0:
-            raise BenchmarkError("warmup_runs cannot be negative")
+        try:
+            validate_iterations(iterations)
+            validate_warmup_runs(warmup_runs)
+        except ValueError as exc:
+            raise BenchmarkError(str(exc)) from exc
         resolved = Path(model_path).expanduser().resolve()
         if not resolved.exists():
             raise ModelNotFoundError(f"ONNX artifact does not exist: {resolved}")
@@ -190,18 +197,14 @@ class ModelProfiler:
             if isinstance(hardware_profile, str)
             else hardware_profile
         )
-        options = ort.SessionOptions()
-        if self._settings.intra_op_threads > 0:
-            options.intra_op_num_threads = self._settings.intra_op_threads
-        options.inter_op_num_threads = self._settings.inter_op_threads
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        options.enable_mem_pattern = True
-        options.log_severity_level = 3
         try:
-            session = ort.InferenceSession(
+            session = create_session(
                 str(resolved),
-                sess_options=options,
-                providers=[self._provider],
+                provider=self._provider,
+                intra_op_threads=self._settings.intra_op_threads,
+                inter_op_threads=self._settings.inter_op_threads,
+                enable_mem_pattern=True,
+                graph_optimization_level=ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
             )
         except Exception as exc:
             raise BenchmarkError(f"unable to create ONNX Runtime session: {exc}") from exc

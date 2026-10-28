@@ -71,6 +71,19 @@ pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2"
 pip install -e ".[dev]"
 ```
 
+The default dependency set installs the CPU build of ONNX Runtime. For NVIDIA
+GPUs replace it in the same environment, because both packages ship the same
+`onnxruntime` module and cannot be installed side by side:
+
+```bash
+pip uninstall -y onnxruntime
+pip install "onnxruntime-gpu>=1.18"
+```
+
+The CLI and the MCP server still request `CPUExecutionProvider` by default;
+pass another provider through the Python API (`ModelProfiler(provider=...)`,
+`OnnxExporter(provider=...)`) once the GPU package is active.
+
 ## Quick start
 
 ```bash
@@ -173,7 +186,7 @@ is convenient for desktop client configuration:
 | `system_info` | none | Report versions and execution providers. |
 | `inspect_model` | `model_path` | Inspect ONNX or PyTorch tensor metadata. |
 | `export_model` | `model_name`, `opset`, `input_shape`, `dynamic_batch`, `simplify` | Export a model to validated ONNX. |
-| `quantize_model` | `model_path`, `precision`, `calibration_samples`, `calibration_method` | Produce FP16 or INT8 artifacts. |
+| `quantize_model` | `model_path`, `precision`, `calibration_samples`, `calibration_method`, `nodes_to_exclude` | Produce FP16 or INT8 artifacts. |
 | `analyze_drift` | `candidate_path`, `reference_model` or `reference_onnx_path`, `num_samples` | Quantify fidelity loss. |
 | `benchmark_model` | `model_path`, `input_shape`, `warmup_runs`, `iterations`, `hardware_profile` | Measure latency and resources. |
 | `auto_tune` | `model_name`, `max_latency_ms`, `max_size_mb`, `min_cosine_similarity`, `allowed_precisions` | Search configurations and persist the run. |
@@ -182,7 +195,13 @@ is convenient for desktop client configuration:
 | `read_report` | `run_id`, `report_format` | Return report content directly. |
 
 Tool results are JSON encoded text, so any MCP client can consume them without a
-custom decoder.
+custom decoder. Anticipated failures are returned as `ToolError` results whose
+text is a JSON object with `error`, `message` and `retryable` fields.
+
+Paths sent by the client are confined to the workspace, reports and cache
+directories plus the process working directory. Add extra directories with
+`EDGE_FORGE_EXTRA_ALLOWED_ROOTS`, or disable the guard for a trusted deployment
+with `EDGE_FORGE_RESTRICT_PATHS=false` or `edge-forge-mcp --allow-unconfined-paths`.
 
 ### Resources
 
@@ -239,6 +258,11 @@ Infeasible candidates are still reported with their rejection reasons for
 auditing. Latency constraints are enforced on p99, not on the mean, so a
 configuration is only selected when its tail latency fits the budget.
 
+The three weights are configurable through `TuningConstraints`
+(`score_weight_latency`, `score_weight_size`, `score_weight_drift`); they only
+need to sum to a positive value. The defaults above reproduce the published
+formula and keep the ranking stable across runs.
+
 ### Hardware profiles
 
 | Profile | Accelerator | Cores | RAM | Latency budget | Max model size |
@@ -276,7 +300,10 @@ variables or a `.env` file. See [.env.example](.env.example).
 | `EDGE_FORGE_SEED` | `42` | Seed for calibration and dummy inputs. |
 | `EDGE_FORGE_INTRA_OP_THREADS` | `0` | ONNX Runtime intra-op threads, zero means automatic. |
 | `EDGE_FORGE_INTER_OP_THREADS` | `1` | ONNX Runtime inter-op threads. |
-| `EDGE_FORGE_CALIBRATION_SAMPLES` | `16` | Default calibration batch count. |
+| `EDGE_FORGE_CALIBRATION_SAMPLES` | `16` | Default calibration batch count (max 4096). |
+| `EDGE_FORGE_MAX_WORKERS` | `1` | Worker budget reserved for future parallel search. |
+| `EDGE_FORGE_RESTRICT_PATHS` | `true` | Confine MCP tool paths to the permitted roots. |
+| `EDGE_FORGE_EXTRA_ALLOWED_ROOTS` | *(empty)* | Extra directories for the MCP server, separated by `os.pathsep`. |
 | `EDGE_FORGE_SERVER_TRANSPORT` | `stdio` | Default MCP transport. |
 | `EDGE_FORGE_SERVER_HOST` | `127.0.0.1` | HTTP bind host. |
 | `EDGE_FORGE_SERVER_PORT` | `8000` | HTTP bind port. |
@@ -356,13 +383,26 @@ and report volumes.
 ## Security
 
 - Report identifiers are validated against path traversal before any file access.
-- Full PyTorch module pickles are rejected by default because deserialization can
-  execute arbitrary code. State dictionaries and TorchScript archives are loaded
-  with the restricted unpickler. Python callers can opt into full pickle loading
-  with `load_model(..., allow_unsafe=True)` for trusted files only.
+- Full PyTorch module pickles and TorchScript archives are rejected by default
+  because deserialization can execute arbitrary code. State dictionaries are
+  loaded with the restricted unpickler; Python callers can opt into the unsafe
+  formats with `load_model(..., allow_unsafe=True)` for trusted files only.
 - HTML reports are fully escaped and contain no scripts, external stylesheets or
   remote assets.
-- The MCP server can read model paths supplied by the client. Run it in a
+- Every path supplied by an MCP client is resolved (following `..` and symbolic
+  links) and confined to the workspace, reports and cache directories, the
+  process working directory and any directory listed in
+  `EDGE_FORGE_EXTRA_ALLOWED_ROOTS`. The CLI is not confined. Disable the guard
+  only for a trusted single-user deployment with
+  `EDGE_FORGE_RESTRICT_PATHS=false` or `edge-forge-mcp --allow-unconfined-paths`.
+- Anticipated failures reach the client as structured `ToolError` payloads
+  (`error`, `message`, `retryable`) instead of opaque protocol errors.
+- Workloads are bounded: input tensors are capped at 25 million elements,
+  benchmarks at 1000 iterations and warmups, calibration at 4096 samples, drift
+  analysis at 512 samples, reference architectures at width 512, depth 32 and
+  4096 classes, and a tuning search at 64 candidates. Every MCP tool runs its
+  blocking work in a worker thread so the protocol event loop keeps answering.
+- The MCP server can still read any file inside its permitted roots. Run it in a
   container or with restricted filesystem permissions when exposing it to
   untrusted agents.
 
@@ -378,7 +418,13 @@ and report volumes.
   graphs add metadata and scale tensors. Compare against the FP32 baseline
   instead of assuming a fixed compression ratio.
 - ONNX Runtime execution providers other than CPU can be injected through the
-  Python API; the CLI and MCP defaults target CPU.
+  Python API; the CLI and MCP defaults target CPU. Install `onnxruntime-gpu`
+  instead of `onnxruntime` to make CUDA available.
+- TorchScript loading is opt-in through `allow_unsafe=True`; the exporter and the
+  MCP server only load registered state dictionaries by default.
+- Graph simplification relies on `onnxsim` when installed. The fallback
+  simplifier is deterministic and removes identity nodes, dead branches and
+  unused initializers, but does not fuse operators.
 
 ## License
 

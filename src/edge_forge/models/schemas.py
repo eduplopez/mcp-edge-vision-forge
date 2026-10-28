@@ -15,6 +15,12 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from edge_forge.config import MAX_OPSET, MIN_OPSET
+from edge_forge.limits import (
+    MAX_BENCHMARK_ITERATIONS,
+    MAX_CALIBRATION_SAMPLES,
+    MAX_TUNING_CANDIDATES,
+    MAX_WARMUP_RUNS,
+)
 from edge_forge.utils import utc_now
 
 
@@ -325,13 +331,20 @@ class QuantizationOptions(BaseModel):
     precision: Precision = Precision.INT8_DYNAMIC
     per_channel: bool = True
     reduce_range: bool = False
-    calibration_samples: int = Field(default=16, ge=1, le=4096)
+    calibration_samples: int = Field(default=16, ge=1, le=MAX_CALIBRATION_SAMPLES)
     calibration_method: CalibrationMethod = CalibrationMethod.GAUSSIAN
     calibration_data_path: str | None = None
     weight_type: Literal["qint8", "quint8"] = "qint8"
     activation_type: Literal["quint8", "qint8"] = "quint8"
     quant_format: Literal["qdq", "qoperator"] = "qdq"
     op_types_to_quantize: list[str] | None = None
+    nodes_to_exclude: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Node names that must stay in floating point. Useful for operators "
+            "whose quantized kernels are slower or numerically unstable on edge hardware."
+        ),
+    )
     extra_options: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -429,8 +442,26 @@ class TuningConstraints(BaseModel):
     simplify_candidates: list[bool] = Field(default_factory=lambda: [True])
     dynamic_batch: bool = True
     hardware_profile: str | None = None
-    warmup_runs: int = Field(default=5, ge=0, le=1000)
-    iterations: int = Field(default=30, ge=1, le=10000)
+    warmup_runs: int = Field(default=5, ge=0, le=MAX_WARMUP_RUNS)
+    iterations: int = Field(default=30, ge=1, le=MAX_BENCHMARK_ITERATIONS)
+    score_weight_latency: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Relative weight of the latency term in the candidate score.",
+    )
+    score_weight_size: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Relative weight of the model size term in the candidate score.",
+    )
+    score_weight_drift: float = Field(
+        default=0.2,
+        ge=0.0,
+        le=1.0,
+        description="Relative weight of the numerical fidelity term in the candidate score.",
+    )
 
     @field_validator("allowed_precisions")
     @classmethod
@@ -469,6 +500,19 @@ class TuningConstraints(BaseModel):
             )
         if self.hardware_profile is not None:
             get_hardware_profile(self.hardware_profile)
+        weight_sum = self.score_weight_latency + self.score_weight_size + self.score_weight_drift
+        if weight_sum <= 0.0:
+            raise ValueError("at least one score weight must be strictly positive")
+        combinations = (
+            len(self.allowed_precisions)
+            * len(self.opset_candidates)
+            * len(self.simplify_candidates)
+        )
+        if combinations > MAX_TUNING_CANDIDATES:
+            raise ValueError(
+                f"the search space has {combinations} candidates, exceeding the limit of "
+                f"{MAX_TUNING_CANDIDATES}"
+            )
         return self
 
 
