@@ -1,0 +1,40 @@
+services:
+  edge-forge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mcp-edge-vision-forge:0.1.0
+    container_name: mcp-edge-vision-forge
+    command:
+      - serve
+      - --transport
+      - streamable-http
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      EDGE_FORGE_WORKSPACE: /app/artifacts
+      EDGE_FORGE_REPORTS_DIR: /app/reports
+      EDGE_FORGE_CACHE_DIR: /app/.cache
+      EDGE_FORGE_SERVER_TRANSPORT: streamable-http
+      EDGE_FORGE_SERVER_HOST: 0.0.0.0
+      EDGE_FORGE_SERVER_PORT: "8000"
+      EDGE_FORGE_LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./reports:/app/reports
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "edge-forge", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    tmpfs:
+      - /tmp:size=256m,mode=1777
