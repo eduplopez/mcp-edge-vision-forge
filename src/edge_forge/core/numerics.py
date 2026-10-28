@@ -75,7 +75,8 @@ def softmax(values: np.ndarray) -> np.ndarray:
     array = np.asarray(values, dtype=np.float64)
     shifted = array - np.max(array, axis=-1, keepdims=True)
     exponentials = np.exp(shifted)
-    return exponentials / np.sum(exponentials, axis=-1, keepdims=True)
+    denominator = np.sum(exponentials, axis=-1, keepdims=True)
+    return np.asarray(exponentials / denominator, dtype=np.float64)
 
 
 def kl_divergence(reference: np.ndarray, candidate: np.ndarray) -> float:
