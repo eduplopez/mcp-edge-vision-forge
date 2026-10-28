@@ -81,6 +81,9 @@ jobs:
 
       - name: Install project and pip-audit
         run: |
+          # The runner ships an old setuptools with known advisories; the project
+          # does not depend on it at runtime, so upgrade it before auditing.
+          python -m pip install --upgrade pip setuptools
           python -m pip install -e .
           python -m pip install "pip-audit>=2.7"
 
