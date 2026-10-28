@@ -79,6 +79,30 @@ class ForgeSettings(BaseSettings):
     server_host: str = Field(default="127.0.0.1", min_length=1)
     server_port: int = Field(default=8000, ge=1, le=65535)
     server_transport: TransportName = "stdio"
+    allow_network: bool = Field(
+        default=False,
+        description=(
+            "Permit the sse and streamable-http transports. HTTP exposes every tool to "
+            "the network, so it must be enabled explicitly and protected by a reverse "
+            "proxy or EDGE_FORGE_AUTH_TOKEN."
+        ),
+    )
+    auth_token: str = Field(
+        default="",
+        description=(
+            "Optional static bearer token required by the HTTP transports. When empty "
+            "the server relies on the surrounding network boundary."
+        ),
+    )
+    operation_timeout_s: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=86_400.0,
+        description=(
+            "Maximum wall-clock time an MCP tool waits before returning a timeout error; "
+            "zero disables the deadline."
+        ),
+    )
     log_level: LogLevelName = "INFO"
 
     @field_validator("workspace", "cache_dir", "reports_dir")

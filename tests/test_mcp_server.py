@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
+from edge_forge.errors import ConfigurationError
 from edge_forge.mcp_server.server import create_server, main
 
 
@@ -278,5 +279,18 @@ def test_main_dispatches_transport(monkeypatch, tmp_path: Path) -> None:
     )
     assert calls == [{"transport": "stdio"}]
 
-    main(["--transport", "streamable-http", "--host", "0.0.0.0", "--port", "9000"])
+    with pytest.raises(ConfigurationError):
+        main(["--transport", "streamable-http", "--host", "0.0.0.0", "--port", "9000"])
+
+    main(
+        [
+            "--transport",
+            "streamable-http",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "9000",
+            "--allow-network",
+        ]
+    )
     assert calls[-1] == {"transport": "streamable-http", "host": "0.0.0.0", "port": 9000}

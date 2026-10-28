@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 import time
 import warnings
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +26,7 @@ from edge_forge.core.numerics import (
 )
 from edge_forge.core.ort_utils import create_session
 from edge_forge.errors import ExportError, ModelNotFoundError, UnsupportedOpsetError
-from edge_forge.limits import validate_input_shape
+from edge_forge.limits import MAX_MODEL_FILE_MB, validate_file_size, validate_input_shape
 from edge_forge.models.registry import extract_output_tensors, make_dummy_input
 from edge_forge.models.schemas import (
     ExportOptions,
@@ -47,6 +49,9 @@ _DTYPE_NAMES: dict[int, str] = {
     TensorProto.INT64: "int64",
     TensorProto.BOOL: "bool",
 }
+_STATIC_INT8_OPERATORS = frozenset(
+    {"QuantizeLinear", "DequantizeLinear", "QLinearConv", "QLinearMatMul", "QLinearAdd"}
+)
 
 
 def validate_opset(opset: int) -> int:
@@ -87,21 +92,44 @@ def _graph_inputs(model: onnx.ModelProto) -> list[onnx.ValueInfoProto]:
     return [value for value in model.graph.input if value.name not in initializers]
 
 
+def _validate_external_data(model: onnx.ModelProto, path: Path) -> None:
+    """Reject external tensors whose location escapes the model directory."""
+    root = path.parent
+    for initializer in model.graph.initializer:
+        if initializer.data_location != TensorProto.EXTERNAL:
+            continue
+        for entry in initializer.external_data:
+            if entry.key != "location":
+                continue
+            location = Path(entry.value)
+            if location.is_absolute() or ".." in location.parts:
+                raise ExportError(
+                    f"ONNX external data for '{initializer.name}' points outside {root}: "
+                    f"{entry.value}"
+                )
+
+
 def inspect_onnx(path: str | Path, *, name: str | None = None) -> ModelInfo:
     """Read static metadata from an ONNX artifact."""
     resolved = Path(path).expanduser().resolve()
     if not resolved.exists():
         raise ModelNotFoundError(f"ONNX artifact does not exist: {resolved}")
     try:
+        validate_file_size(resolved, MAX_MODEL_FILE_MB, label="ONNX artifact")
+    except ValueError as exc:
+        raise ExportError(str(exc)) from exc
+    try:
         model = onnx.load(str(resolved), load_external_data=False)
     except Exception as exc:
         raise ExportError(f"unable to parse ONNX artifact {resolved}: {exc}") from exc
+    _validate_external_data(model, resolved)
 
     metadata = {entry.key: entry.value for entry in model.metadata_props}
     parameter_count = sum(
         math.prod(int(dimension) for dimension in item.dims) for item in model.graph.initializer
     )
     data_types = {initializer.data_type for initializer in model.graph.initializer}
+    node_operators = {node.op_type for node in model.graph.node}
     declared_precision = metadata.get("precision")
     precision = Precision.FP32
     if declared_precision:
@@ -109,12 +137,13 @@ def inspect_onnx(path: str | Path, *, name: str | None = None) -> ModelInfo:
             precision = Precision(declared_precision)
         except ValueError:
             precision = Precision.FP32
-    if declared_precision is None and TensorProto.FLOAT16 in data_types:
+    elif TensorProto.FLOAT16 in data_types:
         precision = Precision.FP16
-    elif declared_precision is None and (
-        TensorProto.INT8 in data_types or TensorProto.UINT8 in data_types
-    ):
-        precision = Precision.INT8_DYNAMIC
+    elif TensorProto.INT8 in data_types or TensorProto.UINT8 in data_types:
+        if _STATIC_INT8_OPERATORS & node_operators:
+            precision = Precision.INT8_STATIC
+        else:
+            precision = Precision.INT8_DYNAMIC
     opset = next(
         (int(entry.version) for entry in model.opset_import if entry.domain in ("", "ai.onnx")),
         None,
@@ -298,6 +327,7 @@ class OnnxExporter:
                 rtol=export_options.rtol,
             )
             if not validation.passed:
+                destination.unlink(missing_ok=True)
                 raise ExportError(
                     f"exported graph failed numerical validation: {validation.message}"
                 )
@@ -409,7 +439,8 @@ class OnnxExporter:
             from onnxsim import simplify as onnxsim_simplify
 
             model = onnx.load(str(path))
-            simplified_model, check = onnxsim_simplify(model, overwrite_input_shapes=False)
+            with redirect_stdout(sys.stderr):
+                simplified_model, check = onnxsim_simplify(model, overwrite_input_shapes=False)
             if not check:
                 raise ExportError("onnxsim reported an invalid simplified graph")
             for entry in simplified_model.opset_import:

@@ -28,6 +28,7 @@ from edge_forge.config import ForgeSettings, get_settings
 from edge_forge.core.exporter import inspect_onnx
 from edge_forge.core.ort_utils import create_session
 from edge_forge.errors import CalibrationError, ModelNotFoundError, QuantizationError
+from edge_forge.limits import MAX_CALIBRATION_FILE_MB, validate_file_size
 from edge_forge.models.schemas import (
     CalibrationMethod,
     Precision,
@@ -51,6 +52,26 @@ _QUANT_FORMATS: dict[str, QuantFormat] = {
 
 def _normalized_shape(spec: TensorSpec) -> tuple[int, ...]:
     return tuple(dimension if dimension > 0 else 1 for dimension in spec.shape)
+
+
+def _safe_tensor_name(name: str) -> str:
+    """Reject tensor names that could escape the calibration directory."""
+    candidate = Path(name).name
+    if not name or candidate != name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise CalibrationError(f"unsafe tensor name in calibration source: {name!r}")
+    return candidate
+
+
+def _load_array(path: Path, *, label: str) -> np.ndarray:
+    """Load a ``.npy`` array without allowing pickle deserialization."""
+    try:
+        validate_file_size(path, MAX_CALIBRATION_FILE_MB, label=label)
+    except ValueError as exc:
+        raise CalibrationError(str(exc)) from exc
+    try:
+        return np.asarray(np.load(path, allow_pickle=False))
+    except (OSError, ValueError) as exc:
+        raise CalibrationError(f"unable to read {label}: {exc}") from exc
 
 
 class SyntheticCalibrationReader(CalibrationDataReader):  # type: ignore[misc]
@@ -137,24 +158,44 @@ class RealCalibrationReader(CalibrationDataReader):  # type: ignore[misc]
         if self._source.is_dir():
             arrays: dict[str, np.ndarray] = {}
             for spec in self._specs:
-                candidate = self._source / f"{spec.name}.npy"
+                safe_name = _safe_tensor_name(spec.name)
+                candidate = (self._source / f"{safe_name}.npy").resolve()
+                if not candidate.is_relative_to(self._source):
+                    raise CalibrationError(
+                        f"calibration array for '{spec.name}' escapes {self._source}"
+                    )
                 if not candidate.exists():
                     raise CalibrationError(
                         f"missing calibration array '{candidate.name}' in {self._source}"
                     )
-                arrays[spec.name] = np.load(candidate)
+                arrays[spec.name] = _load_array(
+                    candidate, label=f"calibration array '{candidate.name}'"
+                )
             return arrays
         if self._source.suffix.lower() == ".npz":
-            with np.load(self._source) as archive:
-                keys = set(archive.files)
-                missing = expected - keys
-                if missing:
-                    raise CalibrationError(
-                        f"calibration archive is missing arrays for: {sorted(missing)}"
-                    )
-                return {name: archive[name] for name in sorted(expected)}
+            try:
+                validate_file_size(
+                    self._source,
+                    MAX_CALIBRATION_FILE_MB,
+                    label="calibration archive",
+                )
+            except ValueError as exc:
+                raise CalibrationError(str(exc)) from exc
+            try:
+                with np.load(self._source, allow_pickle=False) as archive:
+                    keys = set(archive.files)
+                    missing = expected - keys
+                    if missing:
+                        raise CalibrationError(
+                            f"calibration archive is missing arrays for: {sorted(missing)}"
+                        )
+                    return {name: np.asarray(archive[name]) for name in sorted(expected)}
+            except (OSError, ValueError) as exc:
+                raise CalibrationError(
+                    f"unable to read calibration archive {self._source}: {exc}"
+                ) from exc
         if self._source.suffix.lower() == ".npy":
-            array = np.load(self._source)
+            array = _load_array(self._source, label="calibration array")
             name = self._specs[0].name
             return {name: array}
         raise CalibrationError(

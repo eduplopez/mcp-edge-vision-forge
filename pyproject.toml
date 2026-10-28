@@ -43,6 +43,7 @@ dependencies = [
     "rich>=13.7",
     "torch>=2.2",
     "typer>=0.12",
+    "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]
@@ -68,7 +69,15 @@ Issues = "https://github.com/eduplopez/mcp-edge-vision-forge/issues"
 packages = ["src/edge_forge"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "tests", "README.md", "pyproject.toml", "Dockerfile", "Makefile"]
+include = [
+    "src",
+    "tests",
+    "README.md",
+    "SECURITY.md",
+    "pyproject.toml",
+    "Dockerfile",
+    "Makefile",
+]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

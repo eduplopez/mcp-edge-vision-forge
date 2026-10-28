@@ -20,6 +20,7 @@ import torch
 from torch import nn
 
 from edge_forge.errors import ConfigurationError, ModelLoadError, ModelNotFoundError
+from edge_forge.limits import MAX_MODEL_FILE_MB, validate_file_size
 from edge_forge.models.schemas import ModelInfo, Precision, TensorSpec
 
 
@@ -334,6 +335,45 @@ def build_model(name: str, **overrides: Any) -> nn.Module:
     return REGISTRY.build(name, **overrides)
 
 
+def resolve_or_build_model(
+    model_or_path: str | Path,
+    *,
+    input_shape: tuple[int, ...] | None = None,
+    allow_unsafe: bool = False,
+    **overrides: Any,
+) -> tuple[nn.Module, str]:
+    """Load a PyTorch checkpoint when the identifier is an existing file.
+
+    This is the entry point used by the CLI and the MCP server so that a real
+    trained checkpoint can be exported, audited and tuned instead of only the
+    built-in reference architectures.
+
+    Args:
+        model_or_path: Registered model name or path to a ``.pt``/``.pth`` file.
+        input_shape: Shape recorded for later export, drift and benchmarking.
+        allow_unsafe: Forwarded to :func:`load_model`; keep it disabled for files
+            received from an MCP client.
+        **overrides: Architecture constructor arguments used when the model is
+            built from the registry or when a raw state dict is loaded.
+
+    Returns:
+        A ``(model, resolved_name)`` pair. The name is the registry name or the
+        architecture embedded in the checkpoint.
+    """
+    candidate = Path(model_or_path).expanduser()
+    if candidate.is_file():
+        loaded = load_model(
+            candidate,
+            architecture=overrides.get("architecture"),
+            input_shape=input_shape,
+            model_kwargs={key: value for key, value in overrides.items() if key != "architecture"},
+            allow_unsafe=allow_unsafe,
+        )
+        return loaded.model, loaded.architecture
+    name = str(model_or_path)
+    return build_model(name, **overrides), name
+
+
 def get_blueprint(name: str) -> ModelBlueprint:
     """Return the registry entry for a model name."""
     return REGISTRY.get(name)
@@ -477,6 +517,7 @@ def load_model(
     *,
     architecture: str | None = None,
     input_shape: tuple[int, ...] | None = None,
+    model_kwargs: Mapping[str, Any] | None = None,
     seed: int = 0,
     allow_unsafe: bool = False,
 ) -> LoadedModel:
@@ -485,6 +526,16 @@ def load_model(
     State dictionaries are loaded with PyTorch's restricted unpickler. TorchScript
     archives and full ``nn.Module`` pickles can execute arbitrary code during
     deserialization, so both require ``allow_unsafe=True`` from a trusted caller.
+
+    Args:
+        path: Checkpoint file.
+        architecture: Registered architecture used when the checkpoint does not
+            embed one.
+        input_shape: Shape used later for export, drift and benchmarks.
+        model_kwargs: Constructor arguments used when the checkpoint does not
+            embed its own ``model_kwargs``.
+        seed: Recorded in the returned metadata for auditing.
+        allow_unsafe: Permit TorchScript archives and full module pickles.
     """
     resolved = Path(path).expanduser().resolve()
     if not resolved.exists():
@@ -493,6 +544,10 @@ def load_model(
         raise ModelLoadError(
             "load_model handles PyTorch checkpoints only; use inspect_onnx for ONNX files"
         )
+    try:
+        validate_file_size(resolved, MAX_MODEL_FILE_MB, label="model checkpoint")
+    except ValueError as exc:
+        raise ModelLoadError(str(exc)) from exc
 
     scripted = _load_torchscript(resolved) if allow_unsafe else None
     if scripted is not None:
@@ -535,12 +590,13 @@ def load_model(
     if isinstance(payload, Mapping) and "state_dict" in payload:
         state_dict = payload["state_dict"]
         resolved_architecture = str(payload.get("architecture") or architecture or "")
-        model_kwargs = dict(payload.get("model_kwargs") or {})
+        embedded_kwargs = dict(payload.get("model_kwargs") or {})
+        model_kwargs = {**dict(model_kwargs or {}), **embedded_kwargs}
         shape = input_shape or tuple(payload.get("input_shape") or (1, 3, 32, 32))
     else:
         state_dict = payload
         resolved_architecture = architecture or ""
-        model_kwargs = {}
+        model_kwargs = dict(model_kwargs or {})
         shape = input_shape or (1, 3, 32, 32)
 
     if not resolved_architecture:

@@ -33,13 +33,14 @@ from edge_forge.core.drift_analyzer import DriftAnalyzer
 from edge_forge.core.exporter import OnnxExporter, inspect_onnx
 from edge_forge.core.profiler import ModelProfiler, available_providers, runtime_version
 from edge_forge.core.quantizer import QuantizationEngine
-from edge_forge.errors import EdgeForgeError
+from edge_forge.errors import ConfigurationError, EdgeForgeError
 from edge_forge.limits import validate_input_shape, validate_model_parameters
+from edge_forge.mcp_server.auth import BearerTokenMiddleware
 from edge_forge.models.registry import (
-    build_model,
     describe_models,
     inspect_torch_model,
     load_model,
+    resolve_or_build_model,
 )
 from edge_forge.models.schemas import (
     CalibrationMethod,
@@ -127,10 +128,20 @@ def _tool_failure(error: Exception) -> Exception:
     )
 
 
-async def _run_blocking(operation: Callable[[], _ResultT]) -> _ResultT:
+async def _run_blocking(
+    operation: Callable[[], _ResultT],
+    *,
+    timeout_s: float = 0.0,
+) -> _ResultT:
     """Run blocking work off the event loop and translate expected failures."""
     try:
+        if timeout_s > 0:
+            return await asyncio.wait_for(asyncio.to_thread(operation), timeout=timeout_s)
         return await asyncio.to_thread(operation)
+    except TimeoutError as exc:
+        raise _tool_failure(
+            EdgeForgeError(f"operation exceeded the {timeout_s:g}s deadline")
+        ) from exc
     except _HANDLED_ERRORS as exc:
         raise _tool_failure(exc) from exc
 
@@ -207,6 +218,13 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             enabled=active.restrict_paths,
         )
 
+    def model_source(value: str, label: str) -> str:
+        """Return a confined path when the identifier names a checkpoint file."""
+        candidate = Path(value).expanduser()
+        if candidate.is_file() or candidate.suffix.lower() in {".pt", ".pth", ".jit"}:
+            return str(read_path(value, label))
+        return value
+
     @server.tool(
         name="list_models",
         description="List the reproducible reference architectures available for benchmarking.",
@@ -259,7 +277,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             )
             return _json(_dump(info))
 
-        return await _run_blocking(work)
+        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
 
     @server.tool(
         name="export_model",
@@ -283,18 +301,21 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
         def work() -> str:
             shape = _parse_shape(input_shape, (1, 3, 32, 32))
             validate_model_parameters(width=width, depth=depth, num_classes=num_classes)
-            model = build_model(
-                model_name,
+            source = model_source(model_name, "model_name")
+            model, resolved_name = resolve_or_build_model(
+                source,
+                input_shape=shape,
                 width=width,
                 depth=depth,
                 num_classes=num_classes,
             )
+            stem = Path(model_name).stem
             destination = (
                 write_path(output_path)
                 if output_path
                 else _default_output(
                     active.exports_dir,
-                    f"{model_name}-opset{opset}-{short_id()}",
+                    f"{stem}-opset{opset}-{short_id()}",
                 )
             )
             result = exporter.export(
@@ -307,11 +328,11 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
                     dynamic_spatial=dynamic_spatial,
                     simplify=simplify,
                 ),
-                name=model_name,
+                name=resolved_name,
             )
             return _json(_dump(result))
 
-        return await _run_blocking(work)
+        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
 
     @server.tool(
         name="quantize_model",
@@ -364,7 +385,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             )
             return _json(_dump(result))
 
-        return await _run_blocking(work)
+        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
 
     @server.tool(
         name="analyze_drift",
@@ -398,8 +419,10 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
                     thresholds=thresholds,
                 )
             else:
-                model = build_model(
-                    reference_model,
+                source = model_source(reference_model, "reference_model")
+                model, resolved_name = resolve_or_build_model(
+                    source,
+                    input_shape=shape,
                     width=width,
                     depth=depth,
                     num_classes=num_classes,
@@ -410,11 +433,11 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
                     input_shape=shape,
                     num_samples=num_samples,
                     thresholds=thresholds,
-                    reference_name=reference_model,
+                    reference_name=resolved_name,
                 )
             return _json(_dump(report))
 
-        return await _run_blocking(work)
+        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
 
     @server.tool(
         name="benchmark_model",
@@ -442,7 +465,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             )
             return _json(_dump(report))
 
-        return await _run_blocking(work)
+        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
 
     @server.tool(
         name="auto_tune",
@@ -464,6 +487,8 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
         hardware_profile: str = "generic-x86",
         warmup_runs: int = 5,
         iterations: int = 30,
+        calibration_method: str = "gaussian",
+        calibration_data_path: str | None = None,
         width: int = 16,
         depth: int = 3,
         num_classes: int = 10,
@@ -471,40 +496,49 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
     ) -> str:
         shape = _parse_shape(input_shape, (1, 3, 32, 32))
         validate_model_parameters(width=width, depth=depth, num_classes=num_classes)
-        constraints = TuningConstraints(
-            max_latency_ms=max_latency_ms,
-            min_cosine_similarity=min_cosine_similarity,
-            max_size_mb=max_size_mb,
-            allowed_precisions=(
-                [Precision(value) for value in allowed_precisions]
-                if allowed_precisions
-                else [
-                    Precision.FP32,
-                    Precision.FP16,
-                    Precision.INT8_DYNAMIC,
-                    Precision.INT8_STATIC,
-                ]
-            ),
-            opset_candidates=opsets or [17],
-            simplify_candidates=simplify_options or [True],
-            hardware_profile=hardware_profile,
-            warmup_runs=warmup_runs,
-            iterations=iterations,
-        )
-        model = build_model(
-            model_name,
-            width=width,
-            depth=depth,
-            num_classes=num_classes,
+        source = model_source(model_name, "model_name")
+        calibration_path = (
+            str(read_path(calibration_data_path, "calibration_data_path"))
+            if calibration_data_path
+            else None
         )
         report_progress = _progress_reporter(context)
 
         def work() -> str:
+            constraints = TuningConstraints(
+                max_latency_ms=max_latency_ms,
+                min_cosine_similarity=min_cosine_similarity,
+                max_size_mb=max_size_mb,
+                allowed_precisions=(
+                    [Precision(value) for value in allowed_precisions]
+                    if allowed_precisions
+                    else [
+                        Precision.FP32,
+                        Precision.FP16,
+                        Precision.INT8_DYNAMIC,
+                        Precision.INT8_STATIC,
+                    ]
+                ),
+                opset_candidates=opsets or [17],
+                simplify_candidates=simplify_options or [True],
+                hardware_profile=hardware_profile,
+                warmup_runs=warmup_runs,
+                iterations=iterations,
+                calibration_method=CalibrationMethod(calibration_method),
+                calibration_data_path=calibration_path,
+            )
+            model, resolved_name = resolve_or_build_model(
+                source,
+                input_shape=shape,
+                width=width,
+                depth=depth,
+                num_classes=num_classes,
+            )
             result = tuner.tune(
                 model,
                 constraints=constraints,
                 input_shape=shape,
-                model_name=model_name,
+                model_name=resolved_name,
                 progress=report_progress,
             )
             if persist:
@@ -537,7 +571,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             ]
             return _json(payload)
 
-        return await _run_blocking(work)
+        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
 
     @server.tool(
         name="list_reports",
@@ -560,7 +594,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             )
             return _json(_dump(artifacts))
 
-        return await _run_blocking(work)
+        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
 
     @server.tool(
         name="read_report",
@@ -577,7 +611,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
                 return Path(artifacts.files["html"]).read_text(encoding="utf-8")
             return render_markdown(report)
 
-        return await _run_blocking(work)
+        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
 
     @server.resource(
         "edge-forge://catalog/models",
@@ -637,6 +671,28 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
     return server
 
 
+def run_http_with_auth(
+    server: Any,
+    transport: str,
+    host: str,
+    port: int,
+    token: str,
+) -> None:
+    """Serve an HTTP transport behind the static bearer-token middleware."""
+    import uvicorn
+
+    if transport == "streamable-http":
+        app = server.streamable_http_app(host=host)
+    else:
+        app = server.sse_app(host=host)
+    uvicorn.run(
+        BearerTokenMiddleware(app, token),
+        host=host,
+        port=port,
+        log_level="info",
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the MCP server over stdio, SSE or streamable HTTP."""
     parser = argparse.ArgumentParser(
@@ -659,6 +715,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Disable path confinement for this process (trusted single-user deployments).",
     )
     parser.add_argument(
+        "--allow-network",
+        action="store_true",
+        help="Enable the HTTP transports; they are disabled by default.",
+    )
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
         default=None,
@@ -673,6 +734,8 @@ def main(argv: list[str] | None = None) -> None:
         overrides["log_level"] = arguments.log_level
     if arguments.allow_unconfined_paths:
         overrides["restrict_paths"] = False
+    if arguments.allow_network:
+        overrides["allow_network"] = True
     settings = ForgeSettings(**overrides) if overrides else get_settings()
     logging.basicConfig(
         level=getattr(logging, settings.log_level),
@@ -682,11 +745,24 @@ def main(argv: list[str] | None = None) -> None:
     transport = arguments.transport or settings.server_transport
     host = arguments.host or settings.server_host
     port = arguments.port or settings.server_port
+    if transport != "stdio" and not settings.allow_network:
+        raise ConfigurationError(
+            "the sse and streamable-http transports are disabled by default because they "
+            "expose every tool to the network; set EDGE_FORGE_ALLOW_NETWORK=true or pass "
+            "--allow-network, and protect the endpoint with a reverse proxy or "
+            "EDGE_FORGE_AUTH_TOKEN"
+        )
     server = create_server(settings)
     _LOGGER.info("starting MCP server over %s", transport)
     if transport == "stdio":
         server.run(transport="stdio")
+    elif settings.auth_token:
+        run_http_with_auth(server, transport, host, port, settings.auth_token)
     else:
+        _LOGGER.warning(
+            "HTTP transport without EDGE_FORGE_AUTH_TOKEN; restrict access with a firewall "
+            "or a reverse proxy"
+        )
         server.run(transport=transport, host=host, port=port)
 
 

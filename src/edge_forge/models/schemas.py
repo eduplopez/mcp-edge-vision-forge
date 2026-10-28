@@ -120,7 +120,12 @@ HARDWARE_PROFILES: dict[str, HardwareProfile] = {
         accelerator="cpu",
         typical_latency_budget_ms=100.0,
         max_model_size_mb=128.0,
-        supported_precisions=(Precision.FP32, Precision.FP16, Precision.INT8_DYNAMIC),
+        supported_precisions=(
+            Precision.FP32,
+            Precision.FP16,
+            Precision.INT8_DYNAMIC,
+            Precision.INT8_STATIC,
+        ),
     ),
     "jetson-orin-nano": HardwareProfile(
         name="jetson-orin-nano",
@@ -155,7 +160,12 @@ HARDWARE_PROFILES: dict[str, HardwareProfile] = {
         accelerator="cpu",
         typical_latency_budget_ms=40.0,
         max_model_size_mb=200.0,
-        supported_precisions=(Precision.FP32, Precision.FP16, Precision.INT8_DYNAMIC),
+        supported_precisions=(
+            Precision.FP32,
+            Precision.FP16,
+            Precision.INT8_DYNAMIC,
+            Precision.INT8_STATIC,
+        ),
     ),
     "generic-x86": HardwareProfile(
         name="generic-x86",
@@ -442,6 +452,8 @@ class TuningConstraints(BaseModel):
     simplify_candidates: list[bool] = Field(default_factory=lambda: [True])
     dynamic_batch: bool = True
     hardware_profile: str | None = None
+    calibration_method: CalibrationMethod = CalibrationMethod.GAUSSIAN
+    calibration_data_path: str | None = None
     warmup_runs: int = Field(default=5, ge=0, le=MAX_WARMUP_RUNS)
     iterations: int = Field(default=30, ge=1, le=MAX_BENCHMARK_ITERATIONS)
     score_weight_latency: float = Field(
@@ -489,6 +501,8 @@ class TuningConstraints(BaseModel):
 
     @model_validator(mode="after")
     def _validate_budget(self) -> TuningConstraints:
+        if self.calibration_method is CalibrationMethod.REAL and not self.calibration_data_path:
+            raise ValueError("real calibration requires calibration_data_path")
         if (
             self.max_latency_ms is None
             and self.max_size_mb is None

@@ -26,6 +26,17 @@ _SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 _SUPPORTED_FORMATS = ("json", "markdown", "html")
 
 
+def validate_report_id(value: str) -> str:
+    """Validate a report identifier before it is used as a file name.
+
+    Raises:
+        ReportError: If the identifier could escape the report directory.
+    """
+    if not _SAFE_RUN_ID.fullmatch(value) or ".." in value:
+        raise ReportError(f"invalid report identifier: {value}")
+    return value
+
+
 class ReportArtifacts(BaseModel):
     """Paths produced by one report generation call."""
 
@@ -142,7 +153,7 @@ def build_forge_report(result: TuningResult) -> ForgeReport:
 
 
 def _cell(value: Any) -> str:
-    return str(value).replace("|", "\\|").replace("\n", " ")
+    return html.escape(str(value)).replace("|", "\\|").replace("\n", " ")
 
 
 def _candidate_row(candidate: TuningCandidate) -> str:
@@ -174,7 +185,7 @@ def render_markdown(report: ForgeReport) -> str:
     """Render a report as GitHub-flavored Markdown."""
     best = report.best
     lines: list[str] = [
-        f"# {report.title}",
+        f"# {_cell(report.title)}",
         "",
         f"Generated at: {iso_timestamp(report.generated_at)}",
         "",
@@ -478,6 +489,7 @@ class ReportGenerator:
                 f"supported: {', '.join(_SUPPORTED_FORMATS)}"
             )
         report = build_forge_report(result)
+        report_id = validate_report_id(report.report_id)
         files: dict[str, str] = {}
         for report_format in selected:
             if report_format == "json":
@@ -489,14 +501,14 @@ class ReportGenerator:
             else:
                 content = render_html(report)
                 suffix = "html"
-            path = self._output_dir / f"{report.report_id}.{suffix}"
+            path = self._output_dir / f"{report_id}.{suffix}"
             try:
                 path.write_text(content, encoding="utf-8")
             except OSError as exc:
                 raise ReportError(f"unable to write report {path}: {exc}") from exc
             files[report_format] = str(path)
         return ReportArtifacts(
-            report_id=report.report_id,
+            report_id=report_id,
             generated_at=iso_timestamp(utc_now()),
             files=files,
         )

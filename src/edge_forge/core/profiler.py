@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import threading
 import time
@@ -28,6 +29,34 @@ from edge_forge.models.schemas import (
 from edge_forge.utils import file_size_mb
 
 _LOGGER = logging.getLogger(__name__)
+_DTYPE_MAP: dict[str, Any] = {
+    "float": np.float32,
+    "float16": np.float16,
+    "float32": np.float32,
+    "float64": np.float64,
+    "double": np.float64,
+    "int8": np.int8,
+    "uint8": np.uint8,
+    "int16": np.int16,
+    "uint16": np.uint16,
+    "int32": np.int32,
+    "uint32": np.uint32,
+    "int64": np.int64,
+    "uint64": np.uint64,
+    "bool": np.bool_,
+}
+
+
+def _numpy_dtype(onnx_type: str) -> Any:
+    """Translate an ONNX Runtime type string into a NumPy dtype."""
+    token = onnx_type.rsplit("(", 1)[-1].rstrip(")").strip().lower()
+    dtype = _DTYPE_MAP.get(token)
+    if dtype is None:
+        supported = ", ".join(sorted(_DTYPE_MAP))
+        raise BenchmarkError(
+            f"unsupported model input type '{onnx_type}'; supported types: {supported}"
+        )
+    return dtype
 
 
 class ResourceMonitor:
@@ -112,16 +141,7 @@ def _input_arrays(
             validate_input_shape(shape, label=f"input '{model_input.name}' shape")
         except ValueError as exc:
             raise BenchmarkError(str(exc)) from exc
-        if "float16" in model_input.type:
-            dtype: Any = np.float16
-        elif "float64" in model_input.type:
-            dtype = np.float64
-        elif "int64" in model_input.type:
-            dtype = np.int64
-        elif "int32" in model_input.type:
-            dtype = np.int32
-        else:
-            dtype = np.float32
+        dtype = _numpy_dtype(model_input.type)
         if np.issubdtype(dtype, np.floating):
             arrays[model_input.name] = rng.standard_normal(size=shape).astype(dtype)
         else:
@@ -197,36 +217,46 @@ class ModelProfiler:
             if isinstance(hardware_profile, str)
             else hardware_profile
         )
-        try:
-            session = create_session(
-                str(resolved),
-                provider=self._provider,
-                intra_op_threads=self._settings.intra_op_threads,
-                inter_op_threads=self._settings.inter_op_threads,
-                enable_mem_pattern=True,
-                graph_optimization_level=ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
-            )
-        except Exception as exc:
-            raise BenchmarkError(f"unable to create ONNX Runtime session: {exc}") from exc
-
-        feeds = _input_arrays(session, input_shape, seed=self._settings.seed)
-        try:
-            for _ in range(warmup_runs):
-                session.run(None, feeds)
-        except Exception as exc:
-            raise BenchmarkError(f"warmup inference failed: {exc}") from exc
-
+        gc.collect()
         latencies_ms: list[float] = []
-        started = time.perf_counter()
+        session: ort.InferenceSession | None = None
         try:
+            # The monitor starts before the session exists so that the weights, the
+            # memory arena and the warmup buffers are part of the measured RSS delta.
             with ResourceMonitor() as monitor:
-                for _ in range(iterations):
-                    sample_start = time.perf_counter_ns()
-                    session.run(None, feeds)
-                    latencies_ms.append((time.perf_counter_ns() - sample_start) / 1_000_000.0)
-        except Exception as exc:
-            raise BenchmarkError(f"benchmark inference failed: {exc}") from exc
-        duration_s = time.perf_counter() - started
+                try:
+                    session = create_session(
+                        str(resolved),
+                        provider=self._provider,
+                        intra_op_threads=self._settings.intra_op_threads,
+                        inter_op_threads=self._settings.inter_op_threads,
+                        enable_mem_pattern=True,
+                        graph_optimization_level=ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
+                    )
+                except Exception as exc:
+                    raise BenchmarkError(f"unable to create ONNX Runtime session: {exc}") from exc
+
+                feeds = _input_arrays(session, input_shape, seed=self._settings.seed)
+                try:
+                    for _ in range(warmup_runs):
+                        session.run(None, feeds)
+                except Exception as exc:
+                    raise BenchmarkError(f"warmup inference failed: {exc}") from exc
+
+                started = time.perf_counter()
+                try:
+                    for _ in range(iterations):
+                        sample_start = time.perf_counter_ns()
+                        session.run(None, feeds)
+                        latencies_ms.append((time.perf_counter_ns() - sample_start) / 1_000_000.0)
+                except Exception as exc:
+                    raise BenchmarkError(f"benchmark inference failed: {exc}") from exc
+                duration_s = time.perf_counter() - started
+                active_provider = session.get_providers()[0]
+        finally:
+            session = None
+            gc.collect()
+
         latency = _latency_stats(latencies_ms, duration_s)
         process = psutil.Process()
         resources = ResourceUsage(
@@ -257,7 +287,7 @@ class ModelProfiler:
             precision=precision or info.precision,
             opset=info.opset,
             parameters=info.parameters,
-            provider=session.get_providers()[0],
+            provider=active_provider,
             hardware_profile=profile.name if profile is not None else "current-host",
             latency_budget_ms=(profile.typical_latency_budget_ms if profile is not None else None),
             meets_budget=meets_budget,

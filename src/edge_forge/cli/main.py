@@ -20,9 +20,14 @@ from edge_forge.core.drift_analyzer import DriftAnalyzer
 from edge_forge.core.exporter import OnnxExporter, inspect_onnx
 from edge_forge.core.profiler import ModelProfiler, available_providers, runtime_version
 from edge_forge.core.quantizer import QuantizationEngine
-from edge_forge.errors import EdgeForgeError
+from edge_forge.errors import ConfigurationError, EdgeForgeError
 from edge_forge.limits import validate_input_shape
-from edge_forge.models.registry import build_model, describe_models, inspect_torch_model, load_model
+from edge_forge.models.registry import (
+    describe_models,
+    inspect_torch_model,
+    load_model,
+    resolve_or_build_model,
+)
 from edge_forge.models.schemas import (
     CalibrationMethod,
     DriftThresholds,
@@ -342,11 +347,18 @@ def export(
     settings = _settings(ctx)
     try:
         shape = _parse_shape(input_shape)
-        model = build_model(model_name, width=width, depth=depth, num_classes=num_classes)
+        model, resolved_name = resolve_or_build_model(
+            model_name,
+            input_shape=shape,
+            width=width,
+            depth=depth,
+            num_classes=num_classes,
+        )
+        stem = Path(model_name).stem
         destination = (
             output.expanduser().resolve()
             if output is not None
-            else settings.exports_dir / f"{model_name}-opset{opset}.onnx"
+            else settings.exports_dir / f"{stem}-opset{opset}.onnx"
         )
         result = OnnxExporter(settings).export(
             model,
@@ -358,7 +370,7 @@ def export(
                 dynamic_spatial=dynamic_spatial,
                 simplify=simplify,
             ),
-            name=model_name,
+            name=resolved_name,
         )
     except (EdgeForgeError, ValueError) as exc:
         _fail(exc)
@@ -476,14 +488,20 @@ def drift(
                 thresholds=thresholds,
             )
         else:
-            model = build_model(reference_model, width=width, depth=depth, num_classes=num_classes)
+            model, resolved_name = resolve_or_build_model(
+                reference_model,
+                input_shape=shape,
+                width=width,
+                depth=depth,
+                num_classes=num_classes,
+            )
             report = analyzer.compare(
                 model,
                 candidate_path,
                 input_shape=shape,
                 num_samples=samples,
                 thresholds=thresholds,
-                reference_name=reference_model,
+                reference_name=resolved_name,
             )
     except (EdgeForgeError, ValueError) as exc:
         _fail(exc)
@@ -554,6 +572,13 @@ def tune(
     hardware_profile: Annotated[str, typer.Option("--hardware")] = "generic-x86",
     warmup: Annotated[int, typer.Option("--warmup")] = 5,
     iterations: Annotated[int, typer.Option("--iterations")] = 30,
+    calibration_method: Annotated[
+        str, typer.Option("--calibration-method", help="gaussian, uniform, zeros or real.")
+    ] = "gaussian",
+    calibration_data: Annotated[
+        Path | None,
+        typer.Option("--calibration-data", help="Directory, .npy or .npz for real calibration."),
+    ] = None,
     width: Annotated[int, typer.Option("--width")] = 16,
     depth: Annotated[int, typer.Option("--depth")] = 3,
     num_classes: Annotated[int, typer.Option("--num-classes")] = 10,
@@ -575,13 +600,26 @@ def tune(
             hardware_profile=hardware_profile,
             warmup_runs=warmup,
             iterations=iterations,
+            calibration_method=CalibrationMethod(calibration_method),
+            calibration_data_path=(
+                str(calibration_data.expanduser().resolve())
+                if calibration_data is not None
+                else None
+            ),
         )
-        model = build_model(model_name, width=width, depth=depth, num_classes=num_classes)
+        shape = _parse_shape(input_shape)
+        model, resolved_name = resolve_or_build_model(
+            model_name,
+            input_shape=shape,
+            width=width,
+            depth=depth,
+            num_classes=num_classes,
+        )
         result = AutoTuner(settings).tune(
             model,
             constraints=constraints,
-            input_shape=_parse_shape(input_shape),
-            model_name=model_name,
+            input_shape=shape,
+            model_name=resolved_name,
         )
         store = RunStore(settings)
         store.save(result)
@@ -651,15 +689,37 @@ def serve(
     ] = "stdio",
     host: Annotated[str | None, typer.Option("--host")] = None,
     port: Annotated[int | None, typer.Option("--port")] = None,
+    allow_network: Annotated[
+        bool,
+        typer.Option(
+            "--allow-network",
+            help="Enable sse/streamable-http; they are disabled by default.",
+        ),
+    ] = False,
 ) -> None:
     """Run the MCP server."""
-    from edge_forge.mcp_server.server import create_server
+    from edge_forge.mcp_server.server import create_server, run_http_with_auth
 
     settings = _settings(ctx)
     try:
+        if transport != "stdio" and not (allow_network or settings.allow_network):
+            raise ConfigurationError(
+                "the sse and streamable-http transports are disabled by default because "
+                "they expose every tool to the network; set EDGE_FORGE_ALLOW_NETWORK=true "
+                "or pass --allow-network, and protect the endpoint with a reverse proxy "
+                "or EDGE_FORGE_AUTH_TOKEN"
+            )
         server = create_server(settings)
         if transport == "stdio":
             server.run(transport="stdio")
+        elif settings.auth_token:
+            run_http_with_auth(
+                server,
+                transport,
+                host or settings.server_host,
+                port or settings.server_port,
+                settings.auth_token,
+            )
         else:
             server.run(
                 transport=transport,

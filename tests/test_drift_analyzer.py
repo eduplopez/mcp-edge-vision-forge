@@ -65,6 +65,25 @@ def test_quantized_model_reports_fidelity(
     assert 0.0 <= report.metrics.top1_agreement <= 1.0
 
 
+def test_single_output_overall_metrics_match_per_output(
+    settings,
+    tiny_model: nn.Module,
+    int8_onnx: Path,
+    input_shape: tuple[int, ...],
+) -> None:
+    report = DriftAnalyzer(settings).compare(
+        tiny_model,
+        int8_onnx,
+        input_shape=input_shape,
+        num_samples=4,
+    )
+    assert len(report.per_output) == 1
+    assert report.metrics.kl_divergence == pytest.approx(report.per_output[0].metrics.kl_divergence)
+    assert report.metrics.top1_agreement == pytest.approx(
+        report.per_output[0].metrics.top1_agreement
+    )
+
+
 def test_strict_thresholds_detect_drift(
     settings,
     tiny_model: nn.Module,
@@ -176,3 +195,26 @@ def test_compare_accepts_sequential_model(settings, fp32_onnx: Path) -> None:
         num_samples=2,
     )
     assert report.metrics.cosine_similarity == pytest.approx(0.0, abs=1e-6)
+
+
+def test_kl_divergence_is_a_mean_over_samples() -> None:
+    rng = np.random.default_rng(3)
+    reference = rng.standard_normal((6, 8))
+    candidate = reference + 0.1 * rng.standard_normal((6, 8))
+    batched = kl_divergence(reference, candidate)
+    per_sample = np.mean(
+        [kl_divergence(reference[index], candidate[index]) for index in range(len(reference))]
+    )
+    assert batched == pytest.approx(float(per_sample), rel=1e-9)
+
+
+def test_kl_divergence_does_not_grow_with_more_samples() -> None:
+    rng = np.random.default_rng(11)
+    reference = rng.standard_normal((4, 10))
+    candidate = reference + 0.05 * rng.standard_normal((4, 10))
+    single = kl_divergence(reference, candidate)
+    repeated = kl_divergence(
+        np.concatenate([reference, reference]),
+        np.concatenate([candidate, candidate]),
+    )
+    assert repeated == pytest.approx(single, rel=1e-9)

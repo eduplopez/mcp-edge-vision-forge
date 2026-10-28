@@ -43,8 +43,10 @@ def _build_metrics(
     candidate: np.ndarray,
     thresholds: DriftThresholds,
 ) -> DriftMetrics:
-    reference_flat = np.asarray(reference, dtype=np.float64).reshape(-1)
-    candidate_flat = np.asarray(candidate, dtype=np.float64).reshape(-1)
+    reference_array = np.asarray(reference, dtype=np.float64)
+    candidate_array = np.asarray(candidate, dtype=np.float64)
+    reference_flat = reference_array.reshape(-1)
+    candidate_flat = candidate_array.reshape(-1)
     assert_finite(reference_flat, label="reference output")
     assert_finite(candidate_flat, label="candidate output")
     metrics = DriftMetrics(
@@ -52,15 +54,42 @@ def _build_metrics(
         mse=mean_squared_error(reference_flat, candidate_flat),
         mae=mean_absolute_error(reference_flat, candidate_flat),
         max_absolute_error=max_absolute_error(reference_flat, candidate_flat),
-        kl_divergence=kl_divergence(reference_flat, candidate_flat),
+        kl_divergence=kl_divergence(reference_array, candidate_array),
         snr_db=signal_to_noise_db(reference_flat, candidate_flat),
         relative_l1_error=relative_l1_error(reference_flat, candidate_flat),
-        top1_agreement=top1_agreement(np.asarray(reference), np.asarray(candidate)),
+        top1_agreement=top1_agreement(reference_array, candidate_array),
         reference_norm=float(np.linalg.norm(reference_flat)),
         candidate_norm=float(np.linalg.norm(candidate_flat)),
     )
     violations = thresholds.violations(metrics)
     return metrics.model_copy(update={"passed": not violations, "violations": violations})
+
+
+def _aggregate_metrics(
+    reference: np.ndarray,
+    candidate: np.ndarray,
+    per_output: list[OutputDrift],
+    thresholds: DriftThresholds,
+) -> DriftMetrics:
+    """Combine every output into one report-level metric set.
+
+    Magnitude metrics are computed on the concatenated tensors, but the
+    sample-wise metrics are averaged over the per-output values so that a
+    multi-output model keeps a meaningful KL divergence and top-1 agreement.
+    """
+    overall = _build_metrics(reference, candidate, thresholds)
+    if not per_output:
+        return overall
+    kl = float(np.mean([item.metrics.kl_divergence for item in per_output]))
+    agreement = float(np.mean([item.metrics.top1_agreement for item in per_output]))
+    combined = overall.model_copy(
+        update={
+            "kl_divergence": max(kl, 0.0),
+            "top1_agreement": min(max(agreement, 0.0), 1.0),
+        }
+    )
+    violations = thresholds.violations(combined)
+    return combined.model_copy(update={"passed": not violations, "violations": violations})
 
 
 def _resolve_shape(
@@ -172,9 +201,10 @@ class DriftAnalyzer:
             aggregated_candidate.append(candidate_output.reshape(-1))
 
         effective_thresholds = thresholds or DriftThresholds()
-        overall = _build_metrics(
+        overall = _aggregate_metrics(
             np.concatenate(aggregated_reference),
             np.concatenate(aggregated_candidate),
+            per_output,
             effective_thresholds,
         )
         report = DriftReport(
@@ -269,9 +299,10 @@ class DriftAnalyzer:
             )
             aggregated_reference.append(reference_values.reshape(-1))
             aggregated_candidate.append(candidate_values.reshape(-1))
-        overall = _build_metrics(
+        overall = _aggregate_metrics(
             np.concatenate(aggregated_reference),
             np.concatenate(aggregated_candidate),
+            per_output,
             thresholds or DriftThresholds(),
         )
         return DriftReport(

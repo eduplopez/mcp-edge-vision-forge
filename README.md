@@ -117,13 +117,18 @@ edge-forge benchmark artifacts/edge_cnn.onnx --json | jq '.latency.p99_ms'
 | `edge-forge models` | List reproducible reference architectures. |
 | `edge-forge hardware` | List built-in edge hardware profiles. |
 | `edge-forge inspect PATH` | Inspect ONNX or PyTorch tensor metadata. |
-| `edge-forge export MODEL` | Export a registered PyTorch model to ONNX. |
+| `edge-forge export MODEL` | Export a registered model or a checkpoint to ONNX. |
 | `edge-forge quantize PATH` | Produce FP16, dynamic INT8 or static INT8. |
 | `edge-forge drift PATH` | Compare a reference model with a candidate. |
 | `edge-forge benchmark PATH` | Measure latency, FPS, RSS and CPU. |
 | `edge-forge tune MODEL` | Search configurations under constraints. |
 | `edge-forge report RUN_ID` | Render a persisted tuning run. |
 | `edge-forge serve` | Run the MCP server. |
+
+`MODEL` accepts a registered architecture name (`edge_cnn`, `resnet_tiny`,
+`mobilenet_tiny`, `vit_tiny`) or the path to a PyTorch checkpoint created with
+`save_checkpoint`. The checkpoint embeds its architecture and constructor
+arguments, so export, drift and tuning work on trained weights.
 
 Useful options:
 
@@ -139,10 +144,12 @@ Useful options:
 --precision fp16|int8_dynamic|int8_static
 --calibration-samples 16
 --calibration-method gaussian|uniform|zeros|real
+--calibration-data PATH   Directory, .npy or .npz used by real calibration
 --hardware raspberry-pi-5|jetson-orin-nano|coral-edge-tpu|smartphone-midrange|generic-x86
 --max-latency-ms FLOAT
 --max-size-mb FLOAT
 --min-cosine FLOAT
+--allow-network           Enable the sse and streamable-http transports
 ```
 
 ## MCP server
@@ -153,11 +160,19 @@ Start the server over stdio:
 edge-forge serve --transport stdio
 ```
 
-Or over streamable HTTP:
+The HTTP transports are disabled by default because they expose every tool to
+the network. Enable them explicitly and protect the endpoint:
 
 ```bash
-edge-forge serve --transport streamable-http --host 0.0.0.0 --port 8000
+EDGE_FORGE_AUTH_TOKEN=change-me \
+  edge-forge serve --transport streamable-http --host 0.0.0.0 --port 8000 --allow-network
 ```
+
+With `EDGE_FORGE_AUTH_TOKEN` set, every HTTP request must send
+`Authorization: Bearer <token>`. TLS termination, rate limiting and IP
+allow-lists belong to the reverse proxy in front of the process. Without a token
+the server logs a warning and relies entirely on the surrounding network
+boundary.
 
 The dedicated `edge-forge-mcp` entry point accepts the same transport options and
 is convenient for desktop client configuration:
@@ -189,7 +204,7 @@ is convenient for desktop client configuration:
 | `quantize_model` | `model_path`, `precision`, `calibration_samples`, `calibration_method`, `nodes_to_exclude` | Produce FP16 or INT8 artifacts. |
 | `analyze_drift` | `candidate_path`, `reference_model` or `reference_onnx_path`, `num_samples` | Quantify fidelity loss. |
 | `benchmark_model` | `model_path`, `input_shape`, `warmup_runs`, `iterations`, `hardware_profile` | Measure latency and resources. |
-| `auto_tune` | `model_name`, `max_latency_ms`, `max_size_mb`, `min_cosine_similarity`, `allowed_precisions` | Search configurations and persist the run. |
+| `auto_tune` | `model_name`, `max_latency_ms`, `max_size_mb`, `min_cosine_similarity`, `allowed_precisions`, `calibration_method`, `calibration_data_path` | Search configurations and persist the run. |
 | `list_reports` | none | List persisted tuning runs. |
 | `generate_report` | `run_id`, `formats` | Render JSON, Markdown and HTML. |
 | `read_report` | `run_id`, `report_format` | Return report content directly. |
@@ -202,6 +217,8 @@ Paths sent by the client are confined to the workspace, reports and cache
 directories plus the process working directory. Add extra directories with
 `EDGE_FORGE_EXTRA_ALLOWED_ROOTS`, or disable the guard for a trusted deployment
 with `EDGE_FORGE_RESTRICT_PATHS=false` or `edge-forge-mcp --allow-unconfined-paths`.
+`model_name`, `reference_model` and the auto-tuning checkpoint argument accept a
+file only when it is inside those roots.
 
 ### Resources
 
@@ -235,9 +252,15 @@ per input.
 - Cosine similarity: directional agreement between flattened outputs.
 - MSE and MAE: absolute error magnitude.
 - Maximum absolute error: worst-case element-wise deviation.
-- KL divergence: divergence between softmax distributions.
+- KL divergence: mean per-sample divergence between softmax distributions
+  (`batchmean` convention), so samples are never mixed and adding samples does
+  not inflate the metric.
 - SNR: signal-to-noise ratio in decibels.
 - Top-1 agreement: fraction of samples with the same predicted class.
+
+For multi-output models the magnitude metrics are computed on the concatenated
+outputs, while KL divergence and top-1 agreement are averaged over the per-output
+values.
 
 Default acceptance thresholds are cosine similarity `>= 0.99`, MSE `<= 0.01`,
 MAE `<= 0.1`, maximum absolute error `<= 1.0`, KL divergence `<= 0.1` and SNR
@@ -248,15 +271,15 @@ MAE `<= 0.1`, maximum absolute error `<= 1.0`, KL divergence `<= 0.1` and SNR
 Candidates that satisfy every constraint are ranked with a composite score:
 
 ```text
-score = 0.5 * (baseline_p50 / candidate_p50)
+score = 0.5 * (baseline_p99 / candidate_p99)
       + 0.3 * (baseline_size / candidate_size)
       + 0.2 * cosine_similarity
 ```
 
 The FP32 export of the same configuration is the baseline. Higher is better.
 Infeasible candidates are still reported with their rejection reasons for
-auditing. Latency constraints are enforced on p99, not on the mean, so a
-configuration is only selected when its tail latency fits the budget.
+auditing. Both the latency constraint and the score use p99, so a candidate
+with a good median but a poor tail cannot win the search and then be rejected.
 
 The three weights are configurable through `TuningConstraints`
 (`score_weight_latency`, `score_weight_size`, `score_weight_drift`); they only
@@ -307,6 +330,9 @@ variables or a `.env` file. See [.env.example](.env.example).
 | `EDGE_FORGE_SERVER_TRANSPORT` | `stdio` | Default MCP transport. |
 | `EDGE_FORGE_SERVER_HOST` | `127.0.0.1` | HTTP bind host. |
 | `EDGE_FORGE_SERVER_PORT` | `8000` | HTTP bind port. |
+| `EDGE_FORGE_ALLOW_NETWORK` | `false` | Enable the sse and streamable-http transports. |
+| `EDGE_FORGE_AUTH_TOKEN` | *(empty)* | Static bearer token required by the HTTP transports. |
+| `EDGE_FORGE_OPERATION_TIMEOUT_S` | `0` | Per-tool deadline in seconds; zero disables it. |
 | `EDGE_FORGE_LOG_LEVEL` | `INFO` | Logging level. |
 
 ## Architecture
@@ -378,17 +404,30 @@ docker run --rm -it -v "$PWD/artifacts:/app/artifacts" mcp-edge-vision-forge
 
 The default container command starts the MCP server over streamable HTTP on port
 8000. Use `docker compose up --build` for the full setup with persistent artifact
-and report volumes.
+and report volumes. The compose file binds the port to `127.0.0.1`, drops all
+Linux capabilities, runs the root filesystem read-only and applies memory, CPU
+and PID limits. Set `EDGE_FORGE_AUTH_TOKEN` in the environment (or in a local
+`.env` file) to require a bearer token; the container mounts `artifacts/` and
+`reports/` from the host on purpose so results survive restarts.
 
 ## Security
 
-- Report identifiers are validated against path traversal before any file access.
+See [SECURITY.md](SECURITY.md) for the threat model and the disclosure process.
+
+- Report identifiers are validated against path traversal before any file access,
+  and Markdown cells are HTML-escaped.
 - Full PyTorch module pickles and TorchScript archives are rejected by default
   because deserialization can execute arbitrary code. State dictionaries are
   loaded with the restricted unpickler; Python callers can opt into the unsafe
   formats with `load_model(..., allow_unsafe=True)` for trusted files only.
+- Calibration archives are read with `allow_pickle=False`; tensor names that could
+  escape the calibration directory are rejected, and every loaded array is
+  contained in the selected directory and bounded in size.
 - HTML reports are fully escaped and contain no scripts, external stylesheets or
   remote assets.
+- ONNX artifacts with external data are rejected when the tensor location is
+  absolute or contains `..`, and artifacts are deleted when post-export
+  validation fails.
 - Every path supplied by an MCP client is resolved (following `..` and symbolic
   links) and confined to the workspace, reports and cache directories, the
   process working directory and any directory listed in
@@ -400,8 +439,15 @@ and report volumes.
 - Workloads are bounded: input tensors are capped at 25 million elements,
   benchmarks at 1000 iterations and warmups, calibration at 4096 samples, drift
   analysis at 512 samples, reference architectures at width 512, depth 32 and
-  4096 classes, and a tuning search at 64 candidates. Every MCP tool runs its
-  blocking work in a worker thread so the protocol event loop keeps answering.
+  4096 classes, and a tuning search at 64 candidates. Model files are limited to
+  2 GiB and calibration files to 512 MiB. Every MCP tool runs its blocking work
+  in a worker thread so the protocol event loop keeps answering.
+- The HTTP transports are opt-in (`EDGE_FORGE_ALLOW_NETWORK` / `--allow-network`)
+  and can require a static bearer token (`EDGE_FORGE_AUTH_TOKEN`). TLS, rate
+  limiting and client authentication are delegated to a reverse proxy.
+- `EDGE_FORGE_OPERATION_TIMEOUT_S` adds an optional per-tool deadline. It is
+  disabled by default because legitimate exports and tuning runs can take
+  minutes.
 - The MCP server can still read any file inside its permitted roots. Run it in a
   container or with restricted filesystem permissions when exposing it to
   untrusted agents.
@@ -412,8 +458,14 @@ and report volumes.
   single-input reference. Multi-input calibration is supported by the quantizer.
 - Benchmarks measure the current host. A Raspberry Pi profile describes the
   deployment budget, not the machine executing the benchmark.
-- Static INT8 quality depends on the calibration distribution. Use real data for
-  production decisions.
+- Static INT8 quality depends on the calibration distribution. Synthetic Gaussian
+  calibration is adequate for smoke tests; use real data for production decisions.
+- ONNX artifacts larger than 2 GiB are rejected, and external tensor data is
+  validated but never loaded, so models that rely on it must be inlined before
+  inspection.
+- The optional per-tool deadline is disabled by default; a hostile client can
+  still keep a legitimate long-running export or tuning job busy until it
+  finishes.
 - Dynamic INT8 can increase file size for very small models because quantized
   graphs add metadata and scale tensors. Compare against the FP32 baseline
   instead of assuming a fixed compression ratio.

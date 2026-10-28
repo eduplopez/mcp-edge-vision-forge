@@ -181,6 +181,8 @@ class AutoTuner:
                             options=QuantizationOptions(
                                 precision=precision,
                                 calibration_samples=self._settings.calibration_samples,
+                                calibration_method=active_constraints.calibration_method,
+                                calibration_data_path=(active_constraints.calibration_data_path),
                             ),
                         )
                     except EdgeForgeError as exc:
@@ -365,10 +367,13 @@ class AutoTuner:
     ) -> float:
         if candidate.benchmark is None or candidate.drift is None:
             return 0.0
-        latency = candidate.benchmark.latency.p50_ms
+        # Tail latency drives the constraint, so the score must rank on the same
+        # statistic; otherwise a candidate with a good p50 but a poor p99 could
+        # win while being rejected by the latency budget.
+        latency = candidate.benchmark.latency.p99_ms
         size = candidate.size_mb
         if baseline is not None and baseline.benchmark is not None:
-            baseline_latency = max(baseline.benchmark.latency.p50_ms, 1e-6)
+            baseline_latency = max(baseline.benchmark.latency.p99_ms, 1e-6)
             baseline_size = max(baseline.size_mb, 1e-6)
         else:
             baseline_latency = max(latency, 1e-6)

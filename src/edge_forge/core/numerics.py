@@ -80,15 +80,34 @@ def softmax(values: np.ndarray) -> np.ndarray:
 
 
 def kl_divergence(reference: np.ndarray, candidate: np.ndarray) -> float:
-    """Kullback-Leibler divergence D(reference || candidate) of softmax outputs."""
-    left = as_float64(reference)
-    right = as_float64(candidate)
+    """Mean Kullback-Leibler divergence D(reference || candidate) over the batch.
+
+    The class distribution of every sample is obtained with a softmax over its
+    flattened features, so samples are never mixed with each other. The result is
+    the mean per-sample divergence (PyTorch's ``batchmean`` convention): adding
+    more samples with the same per-sample error does not inflate the metric.
+
+    A one-dimensional input is treated as a single sample.
+    """
+    left = np.asarray(reference, dtype=np.float64)
+    right = np.asarray(candidate, dtype=np.float64)
+    if left.size == 0 or right.size == 0:
+        raise ValueError("cannot compare empty arrays")
     if left.shape != right.shape:
-        raise ValueError("arrays must have the same number of elements")
+        raise ValueError("arrays must have the same shape")
+    if left.ndim == 1:
+        left = left.reshape(1, -1)
+        right = right.reshape(1, -1)
+    else:
+        left = left.reshape(left.shape[0], -1)
+        right = right.reshape(right.shape[0], -1)
     probabilities = np.clip(softmax(left), _EPSILON, 1.0)
     candidate_probabilities = np.clip(softmax(right), _EPSILON, 1.0)
-    divergence = np.sum(probabilities * np.log(probabilities / candidate_probabilities))
-    return float(max(divergence, 0.0))
+    per_sample = np.sum(
+        probabilities * np.log(probabilities / candidate_probabilities),
+        axis=-1,
+    )
+    return float(max(float(np.mean(per_sample)), 0.0))
 
 
 def signal_to_noise_db(reference: np.ndarray, candidate: np.ndarray) -> float:

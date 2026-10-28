@@ -8,6 +8,7 @@ one of these constants so that a single call cannot exhaust the host.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 MAX_BENCHMARK_ITERATIONS: int = 1000
 MAX_WARMUP_RUNS: int = 1000
@@ -18,6 +19,33 @@ MAX_DRIFT_SAMPLES: int = 512
 MAX_MODEL_WIDTH: int = 512
 MAX_MODEL_DEPTH: int = 32
 MAX_MODEL_CLASSES: int = 4096
+MAX_MODEL_FILE_MB: float = 2048.0
+MAX_CALIBRATION_FILE_MB: float = 512.0
+
+
+def validate_file_size(
+    path: Path,
+    max_mb: float,
+    *,
+    label: str = "file",
+) -> Path:
+    """Reject files that exceed a hard size budget before they are loaded.
+
+    Args:
+        path: File to check.
+        max_mb: Maximum accepted size in mebibytes.
+        label: Name used in error messages.
+
+    Returns:
+        The validated path.
+
+    Raises:
+        ValueError: If the file is larger than ``max_mb``.
+    """
+    size_mb = path.stat().st_size / (1024 * 1024)
+    if size_mb > max_mb:
+        raise ValueError(f"{label} is {size_mb:.1f} MiB, exceeding the limit of {max_mb:.0f} MiB")
+    return path
 
 
 def validate_input_shape(shape: tuple[int, ...], *, label: str = "input_shape") -> tuple[int, ...]:
