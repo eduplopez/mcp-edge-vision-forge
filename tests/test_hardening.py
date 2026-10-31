@@ -19,7 +19,6 @@ from edge_forge.errors import (
     BenchmarkError,
     CalibrationError,
     ModelLoadError,
-    ModelNotFoundError,
     PathAccessError,
     ReportError,
 )
