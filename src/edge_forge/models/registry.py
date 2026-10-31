@@ -13,6 +13,7 @@ from __future__ import annotations
 import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,7 +21,15 @@ import torch
 from torch import nn
 
 from edge_forge.errors import ConfigurationError, ModelLoadError, ModelNotFoundError
-from edge_forge.limits import MAX_MODEL_FILE_MB, validate_file_size
+from edge_forge.limits import (
+    MAX_MODEL_CLASSES,
+    MAX_MODEL_DEPTH,
+    MAX_MODEL_FILE_MB,
+    MAX_MODEL_PARAMETERS,
+    MAX_MODEL_WIDTH,
+    validate_file_size,
+    validate_input_shape,
+)
 from edge_forge.models.schemas import ModelInfo, Precision, TensorSpec
 
 
@@ -371,7 +380,7 @@ def resolve_or_build_model(
         )
         return loaded.model, loaded.architecture
     name = str(model_or_path)
-    return build_model(name, **overrides), name
+    return build_model(name, **_validated_kwargs(overrides)), name
 
 
 def get_blueprint(name: str) -> ModelBlueprint:
@@ -384,8 +393,8 @@ def list_models() -> list[ModelBlueprint]:
     return REGISTRY.blueprints()
 
 
-def describe_models() -> list[dict[str, Any]]:
-    """Return a JSON-serializable catalog of registered models."""
+@lru_cache(maxsize=1)
+def _describe_models_cached() -> tuple[dict[str, Any], ...]:
     catalog: list[dict[str, Any]] = []
     for blueprint in REGISTRY.blueprints():
         model = REGISTRY.build(blueprint.name)
@@ -401,7 +410,12 @@ def describe_models() -> list[dict[str, Any]]:
                 "supports_dynamic_spatial": blueprint.supports_dynamic_spatial,
             }
         )
-    return catalog
+    return tuple(catalog)
+
+
+def describe_models() -> list[dict[str, Any]]:
+    """Return a JSON-serializable catalog of registered models."""
+    return [dict(item) for item in _describe_models_cached()]
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -512,6 +526,54 @@ def _load_torchscript(path: Path) -> nn.Module | None:
         return None
 
 
+def _validated_shape(value: object) -> tuple[int, ...]:
+    """Validate a shape embedded in a checkpoint or supplied by a caller."""
+    try:
+        shape = tuple(int(dimension) for dimension in cast(Any, value))
+    except (TypeError, ValueError) as exc:
+        raise ModelLoadError(f"input shape is not a sequence of integers: {exc}") from exc
+    try:
+        return validate_input_shape(shape)
+    except ValueError as exc:
+        raise ModelLoadError(str(exc)) from exc
+
+
+def _validated_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Bound the constructor arguments embedded in an untrusted checkpoint."""
+    bounds: dict[str, tuple[int, int]] = {
+        "width": (1, MAX_MODEL_WIDTH),
+        "depth": (1, MAX_MODEL_DEPTH),
+        "num_classes": (1, MAX_MODEL_CLASSES),
+        "heads": (1, MAX_MODEL_WIDTH),
+    }
+    validated: dict[str, Any] = {}
+    for key, value in kwargs.items():
+        bound = bounds.get(key)
+        if bound is None:
+            validated[key] = value
+            continue
+        try:
+            number = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ModelLoadError(f"model argument '{key}' must be an integer") from exc
+        low, high = bound
+        if not low <= number <= high:
+            raise ModelLoadError(f"model argument '{key}' must be between {low} and {high}")
+        validated[key] = number
+    return validated
+
+
+def _enforce_parameter_budget(model: nn.Module, architecture: str) -> None:
+    """Reject models whose parameters and buffers exceed the hard budget."""
+    total = sum(parameter.numel() for parameter in model.parameters())
+    total += sum(buffer.numel() for buffer in model.buffers())
+    if total > MAX_MODEL_PARAMETERS:
+        raise ModelLoadError(
+            f"architecture '{architecture}' has {total:,} parameters and buffers, exceeding "
+            f"the limit of {MAX_MODEL_PARAMETERS:,}"
+        )
+
+
 def load_model(
     path: str | Path,
     *,
@@ -552,7 +614,8 @@ def load_model(
     scripted = _load_torchscript(resolved) if allow_unsafe else None
     if scripted is not None:
         scripted.eval()
-        shape = input_shape or (1, 3, 32, 32)
+        shape = _validated_shape(input_shape or (1, 3, 32, 32))
+        _enforce_parameter_budget(scripted, "torchscript")
         return LoadedModel(
             model=scripted,
             architecture="torchscript",
@@ -579,7 +642,8 @@ def load_model(
 
     if isinstance(payload, nn.Module):
         payload.eval()
-        shape = input_shape or (1, 3, 32, 32)
+        shape = _validated_shape(input_shape or (1, 3, 32, 32))
+        _enforce_parameter_budget(payload, type(payload).__name__)
         return LoadedModel(
             model=payload,
             architecture=type(payload).__name__,
@@ -592,18 +656,19 @@ def load_model(
         resolved_architecture = str(payload.get("architecture") or architecture or "")
         embedded_kwargs = dict(payload.get("model_kwargs") or {})
         model_kwargs = {**dict(model_kwargs or {}), **embedded_kwargs}
-        shape = input_shape or tuple(payload.get("input_shape") or (1, 3, 32, 32))
+        shape = _validated_shape(input_shape or payload.get("input_shape") or (1, 3, 32, 32))
     else:
         state_dict = payload
         resolved_architecture = architecture or ""
         model_kwargs = dict(model_kwargs or {})
-        shape = input_shape or (1, 3, 32, 32)
+        shape = _validated_shape(input_shape or (1, 3, 32, 32))
 
     if not resolved_architecture:
         raise ModelLoadError(
             "checkpoint does not embed an architecture; pass architecture= explicitly"
         )
-    model = build_model(resolved_architecture, **model_kwargs)
+    model = build_model(resolved_architecture, **_validated_kwargs(model_kwargs))
+    _enforce_parameter_budget(model, resolved_architecture)
     try:
         model.load_state_dict(state_dict, strict=True)
     except RuntimeError as exc:

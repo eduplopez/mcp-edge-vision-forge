@@ -271,10 +271,10 @@ def render_markdown(report: ForgeReport) -> str:
             lines.extend(f"- {violation}" for violation in drift.metrics.violations)
             lines.append("")
     lines.extend(["## Environment", ""])
-    lines.extend(f"- {key}: {value}" for key, value in report.environment.items())
+    lines.extend(f"- {_cell(key)}: {_cell(value)}" for key, value in report.environment.items())
     if report.notes:
         lines.extend(["", "## Notes", ""])
-        lines.extend(f"- {note}" for note in report.notes)
+        lines.extend(f"- {_cell(note)}" for note in report.notes)
     lines.append("")
     return "\n".join(lines)
 

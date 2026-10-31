@@ -132,12 +132,20 @@ async def _run_blocking(
     operation: Callable[[], _ResultT],
     *,
     timeout_s: float = 0.0,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> _ResultT:
     """Run blocking work off the event loop and translate expected failures."""
-    try:
+
+    async def runner() -> _ResultT:
         if timeout_s > 0:
             return await asyncio.wait_for(asyncio.to_thread(operation), timeout=timeout_s)
         return await asyncio.to_thread(operation)
+
+    try:
+        if semaphore is None:
+            return await runner()
+        async with semaphore:
+            return await runner()
     except TimeoutError as exc:
         raise _tool_failure(
             EdgeForgeError(f"operation exceeded the {timeout_s:g}s deadline")
@@ -184,6 +192,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
         version=__version__,
         instructions=INSTRUCTIONS,
     )
+    heavy_semaphore = asyncio.Semaphore(active.max_concurrent_tools)
     exporter = OnnxExporter(active)
     quantizer = QuantizationEngine(active)
     analyzer = DriftAnalyzer(active)
@@ -209,10 +218,10 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
         )
 
     def write_path(value: str, label: str = "output_path") -> Path:
-        """Resolve a client supplied output path and confine it to the roots."""
+        """Resolve a client supplied output path and confine it to the write roots."""
         return resolve_within_roots(
             value,
-            active.permitted_roots,
+            active.writable_roots,
             must_exist=False,
             label=label,
             enabled=active.restrict_paths,
@@ -277,7 +286,9 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             )
             return _json(_dump(info))
 
-        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
+        return await _run_blocking(
+            work, timeout_s=active.operation_timeout_s, semaphore=heavy_semaphore
+        )
 
     @server.tool(
         name="export_model",
@@ -289,6 +300,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
     async def export_model_tool(
         model_name: str = "edge_cnn",
         output_path: str | None = None,
+        overwrite: bool = False,
         opset: int = 17,
         input_shape: list[int] | None = None,
         dynamic_batch: bool = True,
@@ -310,14 +322,20 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
                 num_classes=num_classes,
             )
             stem = Path(model_name).stem
-            destination = (
-                write_path(output_path)
-                if output_path
-                else _default_output(
+            if output_path:
+                destination = write_path(output_path)
+                if destination.suffix.lower() != ".onnx":
+                    raise EdgeForgeError("export output_path must end with .onnx")
+                if destination.exists() and not overwrite:
+                    raise EdgeForgeError(
+                        f"export destination already exists: {destination}; pass overwrite=true to "
+                        "replace it"
+                    )
+            else:
+                destination = _default_output(
                     active.exports_dir,
                     f"{stem}-opset{opset}-{short_id()}",
                 )
-            )
             result = exporter.export(
                 model,
                 destination,
@@ -332,7 +350,9 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             )
             return _json(_dump(result))
 
-        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
+        return await _run_blocking(
+            work, timeout_s=active.operation_timeout_s, semaphore=heavy_semaphore
+        )
 
     @server.tool(
         name="quantize_model",
@@ -345,6 +365,7 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
         model_path: str,
         precision: str = "int8_dynamic",
         output_path: str | None = None,
+        overwrite: bool = False,
         calibration_samples: int = 16,
         calibration_method: str = "gaussian",
         calibration_data_path: str | None = None,
@@ -356,14 +377,20 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
         def work() -> str:
             source = read_path(model_path)
             selected = _precision(precision, Precision.INT8_DYNAMIC)
-            destination = (
-                write_path(output_path)
-                if output_path
-                else _default_output(
+            if output_path:
+                destination = write_path(output_path)
+                if destination.suffix.lower() != ".onnx":
+                    raise EdgeForgeError("quantize output_path must end with .onnx")
+                if destination.exists() and not overwrite:
+                    raise EdgeForgeError(
+                        f"quantize destination already exists: {destination}; pass overwrite=true "
+                        "to replace it"
+                    )
+            else:
+                destination = _default_output(
                     active.quantized_dir,
                     f"{source.stem}.{selected.value}",
                 )
-            )
             calibration_path = (
                 read_path(calibration_data_path, "calibration_data_path")
                 if calibration_data_path
@@ -385,7 +412,9 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             )
             return _json(_dump(result))
 
-        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
+        return await _run_blocking(
+            work, timeout_s=active.operation_timeout_s, semaphore=heavy_semaphore
+        )
 
     @server.tool(
         name="analyze_drift",
@@ -437,7 +466,9 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
                 )
             return _json(_dump(report))
 
-        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
+        return await _run_blocking(
+            work, timeout_s=active.operation_timeout_s, semaphore=heavy_semaphore
+        )
 
     @server.tool(
         name="benchmark_model",
@@ -465,7 +496,9 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             )
             return _json(_dump(report))
 
-        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
+        return await _run_blocking(
+            work, timeout_s=active.operation_timeout_s, semaphore=heavy_semaphore
+        )
 
     @server.tool(
         name="auto_tune",
@@ -494,17 +527,17 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
         num_classes: int = 10,
         persist: bool = True,
     ) -> str:
-        shape = _parse_shape(input_shape, (1, 3, 32, 32))
-        validate_model_parameters(width=width, depth=depth, num_classes=num_classes)
-        source = model_source(model_name, "model_name")
-        calibration_path = (
-            str(read_path(calibration_data_path, "calibration_data_path"))
-            if calibration_data_path
-            else None
-        )
         report_progress = _progress_reporter(context)
 
         def work() -> str:
+            shape = _parse_shape(input_shape, (1, 3, 32, 32))
+            validate_model_parameters(width=width, depth=depth, num_classes=num_classes)
+            source = model_source(model_name, "model_name")
+            calibration_path = (
+                str(read_path(calibration_data_path, "calibration_data_path"))
+                if calibration_data_path
+                else None
+            )
             constraints = TuningConstraints(
                 max_latency_ms=max_latency_ms,
                 min_cosine_similarity=min_cosine_similarity,
@@ -571,7 +604,9 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             ]
             return _json(payload)
 
-        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
+        return await _run_blocking(
+            work, timeout_s=active.operation_timeout_s, semaphore=heavy_semaphore
+        )
 
     @server.tool(
         name="list_reports",
@@ -594,7 +629,9 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
             )
             return _json(_dump(artifacts))
 
-        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
+        return await _run_blocking(
+            work, timeout_s=active.operation_timeout_s, semaphore=heavy_semaphore
+        )
 
     @server.tool(
         name="read_report",
@@ -611,7 +648,9 @@ def create_server(settings: ForgeSettings | None = None) -> Any:
                 return Path(artifacts.files["html"]).read_text(encoding="utf-8")
             return render_markdown(report)
 
-        return await _run_blocking(work, timeout_s=active.operation_timeout_s)
+        return await _run_blocking(
+            work, timeout_s=active.operation_timeout_s, semaphore=heavy_semaphore
+        )
 
     @server.resource(
         "edge-forge://catalog/models",
@@ -752,6 +791,19 @@ def main(argv: list[str] | None = None) -> None:
             "--allow-network, and protect the endpoint with a reverse proxy or "
             "EDGE_FORGE_AUTH_TOKEN"
         )
+    if transport != "stdio" and not settings.auth_token and not settings.allow_insecure_http:
+        loopback = host in {"127.0.0.1", "localhost", "::1"}
+        if not loopback:
+            raise ConfigurationError(
+                "EDGE_FORGE_AUTH_TOKEN is required for HTTP transports on a non-loopback host; "
+                "set EDGE_FORGE_ALLOW_INSECURE_HTTP=true to override on a trusted loopback "
+                "interface"
+            )
+        _LOGGER.warning(
+            "HTTP transport without EDGE_FORGE_AUTH_TOKEN on %s; restrict access with a firewall "
+            "or a reverse proxy",
+            host,
+        )
     server = create_server(settings)
     _LOGGER.info("starting MCP server over %s", transport)
     if transport == "stdio":
@@ -759,10 +811,6 @@ def main(argv: list[str] | None = None) -> None:
     elif settings.auth_token:
         run_http_with_auth(server, transport, host, port, settings.auth_token)
     else:
-        _LOGGER.warning(
-            "HTTP transport without EDGE_FORGE_AUTH_TOKEN; restrict access with a firewall "
-            "or a reverse proxy"
-        )
         server.run(transport=transport, host=host, port=port)
 
 

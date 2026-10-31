@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import shutil
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -26,9 +27,14 @@ from onnxruntime.quantization.shape_inference import quant_pre_process
 
 from edge_forge.config import ForgeSettings, get_settings
 from edge_forge.core.exporter import inspect_onnx
+from edge_forge.core.onnx_io import load_onnx
 from edge_forge.core.ort_utils import create_session
 from edge_forge.errors import CalibrationError, ModelNotFoundError, QuantizationError
-from edge_forge.limits import MAX_CALIBRATION_FILE_MB, validate_file_size
+from edge_forge.limits import (
+    MAX_CALIBRATION_ELEMENTS,
+    MAX_CALIBRATION_FILE_MB,
+    validate_file_size,
+)
 from edge_forge.models.schemas import (
     CalibrationMethod,
     Precision,
@@ -63,15 +69,28 @@ def _safe_tensor_name(name: str) -> str:
 
 
 def _load_array(path: Path, *, label: str) -> np.ndarray:
-    """Load a ``.npy`` array without allowing pickle deserialization."""
+    """Load a ``.npy`` array without allowing pickle deserialization.
+
+    The array is memory mapped first so that its element count can be checked
+    before the payload is copied into RAM.
+    """
     try:
         validate_file_size(path, MAX_CALIBRATION_FILE_MB, label=label)
     except ValueError as exc:
         raise CalibrationError(str(exc)) from exc
     try:
-        return np.asarray(np.load(path, allow_pickle=False))
+        mapped = np.load(path, allow_pickle=False, mmap_mode="r")
     except (OSError, ValueError) as exc:
         raise CalibrationError(f"unable to read {label}: {exc}") from exc
+    try:
+        if mapped.size > MAX_CALIBRATION_ELEMENTS:
+            raise CalibrationError(
+                f"{label} contains {mapped.size:,} elements, exceeding the limit of "
+                f"{MAX_CALIBRATION_ELEMENTS:,}"
+            )
+        return np.array(mapped)
+    finally:
+        del mapped
 
 
 class SyntheticCalibrationReader(CalibrationDataReader):  # type: ignore[misc]
@@ -181,6 +200,19 @@ class RealCalibrationReader(CalibrationDataReader):  # type: ignore[misc]
                 )
             except ValueError as exc:
                 raise CalibrationError(str(exc)) from exc
+            max_uncompressed = int(MAX_CALIBRATION_FILE_MB * 1024 * 1024)
+            try:
+                with zipfile.ZipFile(self._source, "r") as container:
+                    uncompressed = sum(info.file_size for info in container.infolist())
+            except (OSError, zipfile.BadZipFile) as exc:
+                raise CalibrationError(
+                    f"unable to read calibration archive {self._source}: {exc}"
+                ) from exc
+            if uncompressed > max_uncompressed:
+                raise CalibrationError(
+                    f"uncompressed calibration archive is {uncompressed / (1024 * 1024):.0f} MiB, "
+                    f"exceeding the limit of {MAX_CALIBRATION_FILE_MB:.0f} MiB"
+                )
             try:
                 with np.load(self._source, allow_pickle=False) as archive:
                     keys = set(archive.files)
@@ -189,7 +221,20 @@ class RealCalibrationReader(CalibrationDataReader):  # type: ignore[misc]
                         raise CalibrationError(
                             f"calibration archive is missing arrays for: {sorted(missing)}"
                         )
-                    return {name: np.asarray(archive[name]) for name in sorted(expected)}
+                    arrays = {}
+                    elements = 0
+                    for name in sorted(expected):
+                        array = np.asarray(archive[name])
+                        elements += int(array.size)
+                        if elements > MAX_CALIBRATION_ELEMENTS:
+                            raise CalibrationError(
+                                f"calibration archive contains {elements:,} elements, exceeding "
+                                f"the limit of {MAX_CALIBRATION_ELEMENTS:,}"
+                            )
+                        arrays[name] = array
+                    return arrays
+            except CalibrationError:
+                raise
             except (OSError, ValueError) as exc:
                 raise CalibrationError(
                     f"unable to read calibration archive {self._source}: {exc}"
@@ -373,7 +418,7 @@ class QuantizationEngine:
         )
 
     def _convert_fp16(self, source: Path, destination: Path) -> None:
-        model = onnx.load(str(source))
+        model = load_onnx(source)
         converted = float16.convert_float_to_float16(
             model,
             keep_io_types=True,
@@ -458,7 +503,7 @@ class QuantizationEngine:
 
     @staticmethod
     def _stamp_precision(path: Path, precision: Precision) -> None:
-        model = onnx.load(str(path))
+        model = load_onnx(path)
         metadata = {entry.key: entry.value for entry in model.metadata_props}
         metadata["precision"] = precision.value
         metadata["quantized_by"] = "mcp-edge-vision-forge"

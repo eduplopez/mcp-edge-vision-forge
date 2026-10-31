@@ -23,7 +23,8 @@ services:
       EDGE_FORGE_SERVER_PORT: "8000"
       EDGE_FORGE_ALLOW_NETWORK: "true"
       # Set this to require Authorization: Bearer <token> on every HTTP request.
-      EDGE_FORGE_AUTH_TOKEN: ${EDGE_FORGE_AUTH_TOKEN:-}
+      EDGE_FORGE_AUTH_TOKEN: ${EDGE_FORGE_AUTH_TOKEN:?set EDGE_FORGE_AUTH_TOKEN to a non-empty value before starting}
+      EDGE_FORGE_ALLOW_INSECURE_HTTP: "false"
       EDGE_FORGE_OPERATION_TIMEOUT_S: "0"
       EDGE_FORGE_LOG_LEVEL: INFO
     ports:

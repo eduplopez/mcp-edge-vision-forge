@@ -24,6 +24,7 @@ from edge_forge.core.numerics import (
     max_absolute_error,
     mean_squared_error,
 )
+from edge_forge.core.onnx_io import load_onnx, validate_external_data
 from edge_forge.core.ort_utils import create_session
 from edge_forge.errors import ExportError, ModelNotFoundError, UnsupportedOpsetError
 from edge_forge.limits import MAX_MODEL_FILE_MB, validate_file_size, validate_input_shape
@@ -94,19 +95,7 @@ def _graph_inputs(model: onnx.ModelProto) -> list[onnx.ValueInfoProto]:
 
 def _validate_external_data(model: onnx.ModelProto, path: Path) -> None:
     """Reject external tensors whose location escapes the model directory."""
-    root = path.parent
-    for initializer in model.graph.initializer:
-        if initializer.data_location != TensorProto.EXTERNAL:
-            continue
-        for entry in initializer.external_data:
-            if entry.key != "location":
-                continue
-            location = Path(entry.value)
-            if location.is_absolute() or ".." in location.parts:
-                raise ExportError(
-                    f"ONNX external data for '{initializer.name}' points outside {root}: "
-                    f"{entry.value}"
-                )
+    validate_external_data(model, path)
 
 
 def inspect_onnx(path: str | Path, *, name: str | None = None) -> ModelInfo:
@@ -118,10 +107,7 @@ def inspect_onnx(path: str | Path, *, name: str | None = None) -> ModelInfo:
         validate_file_size(resolved, MAX_MODEL_FILE_MB, label="ONNX artifact")
     except ValueError as exc:
         raise ExportError(str(exc)) from exc
-    try:
-        model = onnx.load(str(resolved), load_external_data=False)
-    except Exception as exc:
-        raise ExportError(f"unable to parse ONNX artifact {resolved}: {exc}") from exc
+    model = load_onnx(resolved, allow_external_data=False)
     _validate_external_data(model, resolved)
 
     metadata = {entry.key: entry.value for entry in model.metadata_props}
@@ -168,7 +154,7 @@ class GraphSimplifier:
 
     def simplify(self, source: Path, destination: Path) -> Path:
         """Remove identity nodes, dead branches and unused initializers."""
-        model = onnx.load(str(source))
+        model = load_onnx(source)
         self._remove_identities(model)
         self._prune_dead_nodes(model)
         self._prune_initializers(model)

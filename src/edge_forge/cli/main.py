@@ -709,6 +709,18 @@ def serve(
                 "or pass --allow-network, and protect the endpoint with a reverse proxy "
                 "or EDGE_FORGE_AUTH_TOKEN"
             )
+        host_name = host or settings.server_host
+        if (
+            transport != "stdio"
+            and not settings.auth_token
+            and not settings.allow_insecure_http
+            and host_name not in {"127.0.0.1", "localhost", "::1"}
+        ):
+            raise ConfigurationError(
+                "EDGE_FORGE_AUTH_TOKEN is required for HTTP transports on a non-loopback host; "
+                "set EDGE_FORGE_ALLOW_INSECURE_HTTP=true to override on a trusted "
+                "loopback interface"
+            )
         server = create_server(settings)
         if transport == "stdio":
             server.run(transport="stdio")

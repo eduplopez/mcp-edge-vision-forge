@@ -125,10 +125,10 @@ edge-forge benchmark artifacts/edge_cnn.onnx --json | jq '.latency.p99_ms'
 | `edge-forge report RUN_ID` | Render a persisted tuning run. |
 | `edge-forge serve` | Run the MCP server. |
 
-`MODEL` accepts a registered architecture name (`edge_cnn`, `resnet_tiny`,
-`mobilenet_tiny`, `vit_tiny`) or the path to a PyTorch checkpoint created with
-`save_checkpoint`. The checkpoint embeds its architecture and constructor
-arguments, so export, drift and tuning work on trained weights.
+`MODEL` accepts a registered architecture name (`edge_cnn`, `mobile_edge_net`,
+`tiny_vit`) or the path to a PyTorch checkpoint created with `save_checkpoint`.
+The checkpoint embeds its architecture and constructor arguments, so export,
+drift and tuning work on trained weights.
 
 Useful options:
 

@@ -25,7 +25,75 @@ def _payload(result: Any) -> dict[str, Any]:
     return json.loads(result.content[0].text)
 
 
-def test_lists_tools_and_resources(settings) -> None:
+def test_export_rejects_overwrite_without_flag(settings) -> None:
+    server = create_server(settings)
+    path = str(settings.exports_dir / "twice.onnx")
+    first = _payload(
+        _run(
+            server.call_tool(
+                "export_model",
+                {
+                    "model_name": "edge_cnn",
+                    "output_path": path,
+                    "opset": 17,
+                    "input_shape": [1, 3, 32, 32],
+                    "width": 8,
+                    "depth": 1,
+                    "num_classes": 10,
+                },
+            )
+        )
+    )
+    assert first["validation"]["passed"] is True
+    with pytest.raises(ToolError):
+        _run(
+            server.call_tool(
+                "export_model",
+                {
+                    "model_name": "edge_cnn",
+                    "output_path": path,
+                    "opset": 17,
+                    "input_shape": [1, 3, 32, 32],
+                    "width": 8,
+                    "depth": 1,
+                    "num_classes": 10,
+                },
+            )
+        )
+    second = _payload(
+        _run(
+            server.call_tool(
+                "export_model",
+                {
+                    "model_name": "edge_cnn",
+                    "output_path": path,
+                    "overwrite": True,
+                    "opset": 17,
+                    "input_shape": [1, 3, 32, 32],
+                    "width": 8,
+                    "depth": 1,
+                    "num_classes": 10,
+                },
+            )
+        )
+    )
+    assert second["validation"]["passed"] is True
+    server = create_server(settings)
+    with pytest.raises(ToolError):
+        _run(
+            server.call_tool(
+                "export_model",
+                {
+                    "model_name": "edge_cnn",
+                    "output_path": str(settings.workspace / "bad.txt"),
+                    "opset": 17,
+                    "input_shape": [1, 3, 32, 32],
+                    "width": 8,
+                    "depth": 1,
+                    "num_classes": 10,
+                },
+            )
+        )
     server = create_server(settings)
     tools = _run(server.list_tools())
     names = {tool.name for tool in tools}
@@ -287,10 +355,10 @@ def test_main_dispatches_transport(monkeypatch, tmp_path: Path) -> None:
             "--transport",
             "streamable-http",
             "--host",
-            "0.0.0.0",
+            "127.0.0.1",
             "--port",
             "9000",
             "--allow-network",
         ]
     )
-    assert calls[-1] == {"transport": "streamable-http", "host": "0.0.0.0", "port": 9000}
+    assert calls[-1] == {"transport": "streamable-http", "host": "127.0.0.1", "port": 9000}

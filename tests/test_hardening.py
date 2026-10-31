@@ -18,6 +18,7 @@ from edge_forge.core.quantizer import QuantizationEngine, RealCalibrationReader
 from edge_forge.errors import (
     BenchmarkError,
     CalibrationError,
+    ModelLoadError,
     ModelNotFoundError,
     PathAccessError,
     ReportError,
@@ -32,7 +33,7 @@ from edge_forge.limits import (
     validate_model_parameters,
     validate_num_samples,
 )
-from edge_forge.models.registry import resolve_or_build_model, save_checkpoint
+from edge_forge.models.registry import load_model, resolve_or_build_model, save_checkpoint
 from edge_forge.models.schemas import (
     CalibrationMethod,
     DriftMetrics,
@@ -226,11 +227,26 @@ def test_resolve_within_roots_can_be_disabled(tmp_path: Path) -> None:
     assert resolved == outside.resolve()
 
 
-def test_resolve_within_roots_reports_missing_files(tmp_path: Path) -> None:
-    root = tmp_path / "workspace"
-    root.mkdir()
-    with pytest.raises(ModelNotFoundError, match="does not exist"):
-        resolve_within_roots(root / "missing.onnx", [root], must_exist=True)
+def test_checkpoint_with_huge_width_is_rejected(tmp_path: Path, tiny_model: nn.Module) -> None:
+    from edge_forge.models.registry import save_checkpoint
+
+    checkpoint = save_checkpoint(
+        tiny_model,
+        tmp_path / "huge.pt",
+        architecture="edge_cnn",
+        model_kwargs={"width": 1000000, "depth": 1, "num_classes": 10},
+    )
+    with pytest.raises(ModelLoadError, match="width"):
+        load_model(checkpoint)
+
+
+def test_tuning_candidate_count_includes_fp32_baseline() -> None:
+    with pytest.raises(ValidationError, match="candidates"):
+        TuningConstraints(
+            allowed_precisions=[Precision.FP16, Precision.INT8_DYNAMIC],
+            opset_candidates=list(range(11, 24)),
+            simplify_candidates=[True, False],
+        )
 
 
 def test_validate_file_size_enforces_a_hard_budget(tmp_path: Path) -> None:

@@ -517,11 +517,8 @@ class TuningConstraints(BaseModel):
         weight_sum = self.score_weight_latency + self.score_weight_size + self.score_weight_drift
         if weight_sum <= 0.0:
             raise ValueError("at least one score weight must be strictly positive")
-        combinations = (
-            len(self.allowed_precisions)
-            * len(self.opset_candidates)
-            * len(self.simplify_candidates)
-        )
+        precision_count = len(set(self.allowed_precisions) | {Precision.FP32})
+        combinations = precision_count * len(self.opset_candidates) * len(self.simplify_candidates)
         if combinations > MAX_TUNING_CANDIDATES:
             raise ValueError(
                 f"the search space has {combinations} candidates, exceeding the limit of "

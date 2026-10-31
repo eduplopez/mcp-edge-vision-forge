@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import onnxruntime as ort
 
+from edge_forge.core.onnx_io import validate_onnx_file
+
 LOG_SEVERITY_ERROR: int = 3
 
 
@@ -41,6 +43,7 @@ def create_session(
     Raises:
         Exception: Any error raised by ONNX Runtime while loading the artifact.
     """
+    validate_onnx_file(model_path)
     options = ort.SessionOptions()
     if intra_op_threads > 0:
         options.intra_op_num_threads = intra_op_threads

@@ -94,6 +94,20 @@ class ForgeSettings(BaseSettings):
             "the server relies on the surrounding network boundary."
         ),
     )
+    allow_insecure_http: bool = Field(
+        default=False,
+        description=(
+            "Permit HTTP transports without EDGE_FORGE_AUTH_TOKEN. Only safe on a "
+            "trusted loopback interface; the server still refuses to start without a "
+            "token on a non-loopback host."
+        ),
+    )
+    max_concurrent_tools: int = Field(
+        default=2,
+        ge=1,
+        le=32,
+        description="Maximum number of heavy MCP tools that may run at once.",
+    )
     operation_timeout_s: float = Field(
         default=0.0,
         ge=0.0,
@@ -153,13 +167,40 @@ class ForgeSettings(BaseSettings):
 
     @property
     def permitted_roots(self) -> tuple[Path, ...]:
-        """Directories the MCP server may touch when path confinement is enabled.
+        """Directories the MCP server may read when path confinement is enabled.
 
         The workspace, reports and cache directories are always included, together
         with the current working directory and any extra roots supplied through
         ``EDGE_FORGE_EXTRA_ALLOWED_ROOTS``.
         """
         candidates = [self.workspace, self.reports_dir, self.cache_dir, Path.cwd()]
+        candidates.extend(
+            Path(item.strip()).expanduser()
+            for item in self.extra_allowed_roots.split(os.pathsep)
+            if item.strip()
+        )
+        unique: list[Path] = []
+        for candidate in candidates:
+            resolved = candidate.expanduser().resolve()
+            if resolved not in unique:
+                unique.append(resolved)
+        return tuple(unique)
+
+    @property
+    def writable_roots(self) -> tuple[Path, ...]:
+        """Directories the MCP server may write to when path confinement is enabled.
+
+        The current working directory is deliberately excluded so that an agent
+        cannot overwrite project files by accident. Extra roots remain writable
+        because they are configured explicitly by the operator.
+        """
+        candidates = [
+            self.workspace,
+            self.exports_dir,
+            self.quantized_dir,
+            self.reports_dir,
+            self.cache_dir,
+        ]
         candidates.extend(
             Path(item.strip()).expanduser()
             for item in self.extra_allowed_roots.split(os.pathsep)

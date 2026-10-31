@@ -12,8 +12,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     EDGE_FORGE_CACHE_DIR=/app/.cache \
     EDGE_FORGE_SERVER_TRANSPORT=streamable-http \
     EDGE_FORGE_SERVER_HOST=0.0.0.0 \
-    EDGE_FORGE_SERVER_PORT=8000 \
-    EDGE_FORGE_ALLOW_NETWORK=true
+    EDGE_FORGE_SERVER_PORT=8000
 
 WORKDIR /app
 
@@ -37,4 +36,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["edge-forge", "version"]
 
 ENTRYPOINT ["edge-forge"]
-CMD ["serve", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["serve", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8000", "--allow-network"]
