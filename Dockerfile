@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM python:3.12-slim AS runtime
+FROM python:3.15-slim AS runtime
 
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 
